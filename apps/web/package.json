@@ -1,0 +1,33 @@
+{
+  "name": "@otrip/web",
+  "version": "0.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --turbopack --port 3000",
+    "build": "next build",
+    "start": "next start",
+    "lint": "prettier --check \"src/**/*.{ts,tsx}\"",
+    "check-types": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@colyseus/sdk": "0.18.4",
+    "@otrip/contracts": "workspace:*",
+    "@otrip/theme": "workspace:*",
+    "@otrip/world": "workspace:*",
+    "clsx": "^2.1.1",
+    "next": "16.3.8",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "tailwind-merge": "^3.4.0",
+    "three": "0.186.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.3.3",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/three": "0.186.0",
+    "tailwindcss": "4.3.3",
+    "typescript": "5.9.3"
+  }
+}

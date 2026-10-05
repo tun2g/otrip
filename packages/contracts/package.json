@@ -1,0 +1,22 @@
+{
+  "name": "@otrip/contracts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Schemas and pure derivations shared by the web app and the realtime server: the weather feed, and the sky state the scene is driven by.",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "lint": "prettier --check \"src/**/*.ts\"",
+    "check-types": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

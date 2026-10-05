@@ -1,0 +1,27 @@
+{
+  "name": "otrip",
+  "private": true,
+  "packageManager": "pnpm@10.16.1",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "turbo run dev",
+    "dev:web": "pnpm --filter @otrip/web dev",
+    "dev:server": "pnpm --filter @otrip/server dev",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "check-types": "turbo run check-types",
+    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,md,json}\"",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^21.0.0",
+    "@commitlint/config-conventional": "21.0.2",
+    "husky": "9.1.7",
+    "lint-staged": "17.0.7",
+    "prettier": "3.8.4",
+    "turbo": "2.11.7",
+    "typescript": "5.9.3"
+  }
+}

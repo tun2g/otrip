@@ -1,0 +1,21 @@
+{
+  "name": "@otrip/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --experimental-strip-types --watch src/main.ts",
+    "start:prod": "node --experimental-strip-types src/main.ts",
+    "lint": "prettier --check \"src/**/*.ts\"",
+    "check-types": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@otrip/contracts": "workspace:*",
+    "@otrip/world": "workspace:*",
+    "colyseus": "0.18.9"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,19 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//otrip//VN
+BEGIN:VEVENT
+UID:ho-tay-2026-10-05T06:00@otrip
+DTSTAMP:20261004T050300Z
+DTSTART:20261004T230000Z
+DTEND:20261005T000000Z
+SUMMARY:Hồ Tây · sương mù trên hồ · otrip
+DESCRIPTION:Dự báo lúc đó: sương mù trên hồ 0/100 (Khó)\, độ ẩm 84%\, mây thấp 5%.\nMở: http://localhost:3000/ho-tay?luc=2026-10-05T06%3A00
+LOCATION:Hồ Tây\, Tây Hồ\, Hà Nội
+URL:http://localhost:3000/ho-tay?luc=2026-10-05T06%3A00
+BEGIN:VALARM
+TRIGGER:-PT10M
+ACTION:DISPLAY
+DESCRIPTION:Hồ Tây: cơ hội sương mù trên hồ chỉ 0/100
+END:VALARM
+END:VEVENT
+END:VCALENDAR

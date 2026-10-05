@@ -1,0 +1,46 @@
+/*
+  @otrip/theme — UI design tokens. Imported by every app's globals.css.
+
+  "Biển mây" — the HUD floats over a fullscreen 3D scene, so surfaces are
+  translucent panels rather than pages. Dark is the only mode: the scene owns
+  the brightness, and a light UI mode would fight the dawn palette.
+
+  Scene colors (sky, terrain, cloud sea) are NOT here — they belong to each
+  location's recipe in @otrip/world, because they vary per destination.
+*/
+
+@theme {
+  /* Surfaces — translucent panels over the canvas */
+  --color-background: #0b1020;
+  --color-panel: #141c33;
+  --color-panel-strong: #1d2745;
+
+  /* Text */
+  --color-foreground: #f2ece2;
+  --color-muted-foreground: #b9b3ab;
+  --color-subtle: #837d77;
+
+  /* Borders */
+  --color-border: #2a3450;
+  --color-border-strong: #3d4a6b;
+
+  /* Dawn accents — pulled from the Tà Xùa sunrise, reused across the UI */
+  --color-accent: #f2a679;
+  --color-accent-strong: #e07a53;
+  --color-haze: #cdd9e6;
+
+  /* Radii — rounded, matching the soft low-poly look */
+  --radius-panel: 1.5rem;
+  --radius-control: 0.875rem;
+
+  /* Shadows — soft, never harsh, the scene is already high contrast */
+  --shadow-panel: 0 8px 32px rgb(0 0 0 / 0.35);
+
+  /* Fonts — both carry full Vietnamese diacritics, which the rounded display
+     faces commonly paired with this look (e.g. Fredoka) do not reliably do. */
+  --font-display: var(--font-nunito), ui-rounded, system-ui, sans-serif;
+  --font-body: var(--font-be-vietnam), system-ui, sans-serif;
+
+  /* Motion */
+  --ease-soft: cubic-bezier(0.22, 1, 0.36, 1);
+}

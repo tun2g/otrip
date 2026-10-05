@@ -1,0 +1,14 @@
+@import 'tailwindcss';
+/* Shared design tokens — single source of truth. Relative path (Turbopack's
+   CSS resolver doesn't resolve node_modules package CSS imports). */
+@import '../../../../packages/theme/theme.css';
+
+html,
+body {
+  background: var(--color-background);
+  color: var(--color-foreground);
+}
+
+body {
+  font-family: var(--font-body);
+}

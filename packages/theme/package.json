@@ -1,0 +1,14 @@
+{
+  "name": "@otrip/theme",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Single source of truth for UI design tokens (colors, radii, shadows). Imported by every app's globals.css. Scene palettes live in @otrip/world, next to the recipe they belong to.",
+  "exports": {
+    "./theme.css": "./theme.css",
+    "./colors": "./colors.js"
+  },
+  "files": [
+    "theme.css",
+    "colors.js"
+  ]
+}

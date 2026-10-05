@@ -1,0 +1,51 @@
+tmp/
+plans/**/*
+!plans/templates/*
+screenshots/*
+docs/screenshots/*
+docs/assets/*
+docs/research/*
+docs/session-reports/*
+docs/test-cases/*
+claude-prime-*.zip
+.mcp.json
+CLAUDE.local.md
+.tasks/
+
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+.next/
+.turbo/
+*.tsbuildinfo
+
+# env
+.env
+.env.local
+.env.*.local
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# os
+.DS_Store
+
+# AI tools
+.claude/
+
+# Written by `next dev` on every run; the project's instructions live in
+# .claude/rules, so these are regenerated noise rather than source.
+AGENTS.md
+CLAUDE.md
+
+# Source assets before processing. Every one is CC0 and re-downloadable from
+# assets/CREDITS.md, so the repo carries the processed versions only:
+# apps/web/public/audio (12MB) and apps/web/public/models (2.6MB).
+assets/audio/raw/
+assets/models/raw/
