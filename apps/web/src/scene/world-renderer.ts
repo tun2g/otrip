@@ -151,6 +151,7 @@ export type WorldRenderer = {
   setDiscovered: (ids: Set<string>) => void;
   /** Jump to a place already visited. Walking is only required the first time. */
   travelTo: (poiId: string) => void;
+  travelToPosition: (x: number, z: number) => void;
   onDiscover: (handler: ((poi: ResolvedPoi) => void) | null) => void;
   /** Where the walker is, for the compass and the minimap. */
   localPosition: () => { x: number; z: number; yaw: number };
@@ -194,7 +195,8 @@ export const createWorldRenderer = (
   humanSource?: HumanSource
 ): WorldRenderer => {
   const settings = QUALITY_SETTINGS[tier];
-  const terrain = createTerrain(recipe, settings.segments);
+  // Quality must not change collision terrain, town layout or spawn points.
+  const terrain = createTerrain(recipe);
 
   const renderer = new WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
   renderer.setClearColor(0x000000, 0);
@@ -333,7 +335,7 @@ export const createWorldRenderer = (
   // house ended 114 m from one.
   const townPlan = planTown(terrain, recipe, 1);
 
-  const avatars = createAvatars();
+  const avatars = createAvatars(humanSource);
   scene.add(avatars.group);
 
   // One site, used both for the jetty and for the name that points at it.
@@ -775,7 +777,7 @@ export const createWorldRenderer = (
     } else {
       controls.update();
     }
-    avatars.update(delta);
+    avatars.update(delta, camera.position);
 
     if (blend < 1) {
       blend = Math.min(1, blend + delta / TRANSITION_SECONDS);
@@ -952,6 +954,7 @@ export const createWorldRenderer = (
       const poi = pois.find((entry) => entry.id === poiId);
       if (poi && walker) walker.teleport(poi.x, poi.z + 30);
     },
+    travelToPosition: (x, z) => walker?.teleport(x, z),
     setDiscovered: (ids) => {
       discovered = new Set(ids);
       markers.setDiscovered(discovered);

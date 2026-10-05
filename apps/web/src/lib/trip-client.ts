@@ -1,4 +1,4 @@
-import { Client, getStateCallbacks, type Room } from '@colyseus/sdk';
+import { Client, type Room } from '@colyseus/sdk';
 
 import type { RemotePlayer } from '@/scene/avatars';
 
@@ -10,6 +10,7 @@ export type TripConnection = {
   onPlayers: (handler: (players: RemotePlayer[]) => void) => void;
   onChat: (handler: (line: ChatLine) => void) => void;
   move: (x: number, z: number, yaw: number) => void;
+  relocate: (x: number, z: number) => void;
   say: (text: string) => void;
   leave: () => void;
 };
@@ -23,12 +24,18 @@ type PlayerFields = { name: string; x: number; y: number; z: number; yaw: number
  * deliberately no "find me any room": the social unit here is a few friends who
  * already know each other, which is also why there is no moderation queue.
  */
-export const connectToTrip = async (location: string, name: string, roomId?: string): Promise<TripConnection> => {
+export const connectToTrip = async (
+  location: string,
+  name: string,
+  roomId?: string,
+  spawn?: { x: number; z: number }
+): Promise<TripConnection> => {
   const client = new Client(endpoint());
 
-  const room = roomId ? await client.joinById(roomId, { name }) : await client.create('trip', { location, name });
+  const room = roomId
+    ? await client.joinById(roomId, { name, location, spawn })
+    : await client.create('trip', { location, name, spawn });
 
-  const callbacks = getStateCallbacks(room);
   let playersHandler: ((players: RemotePlayer[]) => void) | null = null;
 
   const snapshot = () => {
@@ -46,7 +53,6 @@ export const connectToTrip = async (location: string, name: string, roomId?: str
   // One snapshot per change rather than per field: the roster is at most eight
   // people, so rebuilding it is cheaper than tracking individual bindings.
   room.onStateChange(() => snapshot());
-  void callbacks;
 
   return {
     room,
@@ -61,6 +67,7 @@ export const connectToTrip = async (location: string, name: string, roomId?: str
       });
     },
     move: (x, z, yaw) => room.send('move', { x, z, yaw }),
+    relocate: (x, z) => room.send('relocate', { x, z }),
     say: (text) => room.send('chat', { text }),
     leave: () => void room.leave(),
   };

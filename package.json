@@ -13,6 +13,7 @@
     "lint": "turbo run lint",
     "check-types": "turbo run check-types",
     "format": "prettier --write \"**/*.{ts,tsx,js,jsx,md,json}\"",
+    "test:multiplayer": "node --experimental-strip-types --test tests/multiplayer.test.ts",
     "prepare": "husky"
   },
   "devDependencies": {

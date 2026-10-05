@@ -120,6 +120,19 @@ cần cập nhật domain và recreate Caddy theo README của repo đó. Kiểm
 `https://otrip.chamee.site/` và server tại `https://otrip-api.chamee.site/health`.
 Phòng đi chung lưu trong RAM, khởi động lại server sẽ ngắt các phòng hiện tại.
 
+### Kiểm tra multiplayer
+
+`pnpm test:multiplayer` khởi động server tạm, tạo hai client thật và kiểm tra
+vị trí lúc vào phòng, chuyển động hai chiều, chat, đi nhanh, người vào sau và rời phòng
+ở cả bốn địa điểm. Kiểm tra trực quan trên VPS bằng hai cửa sổ vào cùng link mời.
+
+Phòng hiện đồng bộ vị trí/hướng nhân vật, đi nhanh và chat. Giờ mô phỏng, lựa chọn
+thời tiết, NPC và trạng thái xe/thuyền vẫn chạy riêng trên từng máy.
+
+Bản đồ lớn có danh sách **Xe máy & thuyền**: chọn điểm để phóng tới vị trí,
+xem khoảng cách và hướng dẫn tương tác. Điểm xe lấy từ cùng danh sách bãi đỗ
+mà thế giới 3D sử dụng.
+
 ## Chưa làm
 
 Tài khoản, lưu trữ lâu dài, phòng công khai và

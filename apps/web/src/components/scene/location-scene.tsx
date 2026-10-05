@@ -59,6 +59,8 @@ const UNLOCK_GRACE = 250;
 export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
   const { forecast, error, nowIndex } = useForecast(recipe.slug);
   const trip = useTrip(recipe.slug);
+  const [pendingTrip, setPendingTrip] = useState<{ name: string; roomId?: string } | null>(null);
+  const inviteHandled = useRef(false);
   const settings = useSettings();
   const exploration = useExploration(recipe.slug);
 
@@ -168,10 +170,34 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
   // the link, so do it without making the guest hunt for a button.
   useEffect(() => {
     const invited = new URLSearchParams(window.location.search).get('phong');
-    if (!invited || trip.status !== 'idle') return;
-    const remembered = window.localStorage.getItem('otrip:name') ?? 'Khách';
-    trip.start(remembered, invited);
+    if (!invited || inviteHandled.current) return;
+    inviteHandled.current = true;
+    let remembered = 'Khách';
+    try {
+      remembered = window.localStorage.getItem('otrip:name') ?? remembered;
+    } catch {}
+    setPendingTrip({ name: remembered, roomId: invited });
   }, [trip]);
+
+  // Wait for the actual walker: the server must validate movement from the
+  // same starting point, including when an invite arrives before assets load.
+  useEffect(() => {
+    if (!pendingTrip) return;
+    const join = () => {
+      const renderer = rendererRef.current;
+      if (!renderer) return false;
+      renderer.setWalking(true);
+      setWalking(true);
+      trip.start(pendingTrip.name, pendingTrip.roomId, renderer.localPosition());
+      setPendingTrip(null);
+      return true;
+    };
+    if (join()) return;
+    const timer = window.setInterval(() => {
+      if (join()) window.clearInterval(timer);
+    }, 100);
+    return () => window.clearInterval(timer);
+  }, [pendingTrip, trip.start]);
 
   useEffect(() => {
     if (trip.status === 'joined') setWalking(true);
@@ -320,7 +346,8 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
       } catch {
         // Private browsing: the trip still works, the name just is not kept.
       }
-      trip.start(name);
+      const roomId = new URLSearchParams(window.location.search).get('phong') ?? undefined;
+      setPendingTrip({ name, roomId });
     },
     [trip]
   );
@@ -581,6 +608,18 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
     window.setTimeout(() => setRemindLabel('Nhắc tôi'), 2200);
   }, [forecast, index, recipe]);
 
+  const travel = useCallback(
+    (destination: string | { x: number; z: number }) => {
+      const renderer = rendererRef.current;
+      if (!renderer) return;
+      if (typeof destination === 'string') renderer.travelTo(destination);
+      else renderer.travelToPosition(destination.x, destination.z);
+      const position = renderer.localPosition();
+      trip.relocate(position.x, position.z);
+    },
+    [trip.relocate]
+  );
+
   const onLocalMove = useCallback(
     (move: LocalMove) => {
       if (trip.status === 'joined') trip.move(move.x, move.z, move.yaw);
@@ -798,7 +837,7 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
                 heading={heading}
                 walking={walking}
                 onWalk={() => setWalking(true)}
-                onTravel={(id) => rendererRef.current?.travelTo(id)}
+                onTravel={travel}
                 onOpenMap={() => setMapOpen(true)}
               />
             </div>
@@ -846,7 +885,9 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
         player={player}
         others={trip.players}
         routes={routes}
-        onTravel={(id) => rendererRef.current?.travelTo(id)}
+        parking={parking}
+        onTravelToParking={(x, z) => travel({ x, z })}
+        onTravel={travel}
         canTravel={walking}
       />
     </div>

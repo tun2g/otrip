@@ -530,19 +530,23 @@ export const drawHeadingMarker = (
   context.restore();
 };
 
-const KIND_LABEL: Record<ResolvedPoi['kind'], string> = {
+type MapPoint = Omit<ResolvedPoi, 'kind'> & { kind: ResolvedPoi['kind'] | 'parking' };
+
+const KIND_LABEL: Record<MapPoint['kind'], string> = {
   summit: 'Đỉnh núi',
   valley: 'Sống núi',
-  shore: 'Bờ nước',
+  shore: 'Bến thuyền',
+  parking: 'Điểm lấy xe máy',
   island: 'Đảo',
   town: 'Phố',
   grove: 'Rừng cây',
 };
 
-const KIND_GLYPH: Record<ResolvedPoi['kind'], string> = {
+const KIND_GLYPH: Record<MapPoint['kind'], string> = {
   summit: '▲',
   valley: '⌃',
-  shore: '≈',
+  shore: '⚓',
+  parking: 'P',
   island: '◍',
   town: '▣',
   grove: '♣',
@@ -569,14 +573,15 @@ const ROUTE_STYLE: Record<
 };
 
 const SCALE_CHOICES = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000];
-const MAX_ZOOM = 4;
+const MAX_ZOOM = 16;
+const NO_PARKING: readonly { x: number; y: number; z: number }[] = [];
 const NO_PEOPLE: MapPerson[] = [];
 
 const formatDistance = (metres: number) =>
   metres >= 1000 ? `${(metres / 1000).toFixed(metres % 1000 === 0 ? 0 : 1)} km` : `${Math.round(metres)} m`;
 
 /** Undiscovered places are a question mark, not a pin, so the offset has to be stable between opens. */
-const approximate = (poi: ResolvedPoi, seed: string, terrainSize: number) => {
+const approximate = (poi: MapPoint, seed: string, terrainSize: number) => {
   const random = createPrng(`${seed}:map:${poi.id}`);
   const angle = random() * Math.PI * 2;
   const radius = terrainSize * (0.025 + random() * 0.035);
@@ -590,6 +595,8 @@ type WorldMapProps = {
   recipe: LocationRecipe;
   relief: Relief | null;
   pois: ResolvedPoi[];
+  parking?: readonly { x: number; y: number; z: number }[];
+  onTravelToParking?: (x: number, z: number) => void;
   discovered: Set<string>;
   player: MapPlayer | null;
   others?: MapPerson[];
@@ -610,7 +617,9 @@ export const WorldMap = ({
   onClose,
   recipe,
   relief,
-  pois,
+  pois: landmarks,
+  parking = NO_PARKING,
+  onTravelToParking,
   discovered,
   player,
   others = NO_PEOPLE,
@@ -618,6 +627,20 @@ export const WorldMap = ({
   onTravel,
   canTravel = true,
 }: WorldMapProps) => {
+  const pois = useMemo<MapPoint[]>(
+    () => [
+      ...landmarks,
+      ...parking.map((spot, index) => ({
+        ...spot,
+        id: `parking-${index}`,
+        kind: 'parking' as const,
+        name: parking.length === 1 ? 'Điểm lấy xe máy' : `Điểm lấy xe máy ${index + 1}`,
+        note: 'Xe máy đỗ bên đường trong thế giới 3D. Đi sát xe rồi nhấn E, hoặc chạm nút tương tác, để lên xe. Không có bước thanh toán.',
+      })),
+    ],
+    [landmarks, parking]
+  );
+  const transport = pois.filter((poi) => poi.kind === 'parking' || poi.kind === 'shore');
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const frameRef = useRef<HTMLDivElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -1092,9 +1115,40 @@ export const WorldMap = ({
           <p className="absolute inset-0 grid place-items-center text-xs text-muted-foreground">Đang dựng bản đồ…</p>
         )}
 
+        <details
+          open
+          className="absolute top-3 left-3 z-10 max-w-[min(20rem,calc(100%-5rem))] rounded-panel border border-border bg-panel/95 p-3 shadow-panel"
+        >
+          <summary className="cursor-pointer text-sm font-medium text-accent">
+            Xe máy &amp; thuyền · {transport.length} điểm
+          </summary>
+          <div className="mt-2 flex max-h-32 flex-col gap-1 overflow-y-auto">
+            {transport.length === 0 && <p className="text-xs text-subtle">Chưa có điểm xe hoặc bến thuyền tại đây.</p>}
+            {transport.map((point) => (
+              <button
+                key={point.id}
+                type="button"
+                onClick={() => {
+                  setSelected(point.id);
+                  setView(clampView({ x: point.x, z: point.z, scale: fitScale * 8 }));
+                }}
+                className="min-h-11 rounded-control border border-border px-3 py-2 text-left text-xs hover:border-accent"
+              >
+                <span aria-hidden="true">{KIND_GLYPH[point.kind]} </span>
+                {point.name}
+                {player && (
+                  <span className="ml-2 text-subtle">
+                    {formatDistance(Math.hypot(point.x - player.x, point.z - player.z))}
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
+        </details>
+
         {relief &&
           pois.map((poi) => {
-            const found = discovered.has(poi.id) || alwaysOnMap(poi);
+            const found = poi.kind === 'parking' || discovered.has(poi.id) || alwaysOnMap(poi);
             const spot = found ? { x: poi.x, z: poi.z, radius: 0 } : approximate(poi, recipe.seed, terrainSize);
             const point = project(spot.x, spot.z);
             if (point.x < -60 || point.y < -60 || point.x > frame.width + 60 || point.y > frame.height + 60)
@@ -1234,6 +1288,11 @@ export const WorldMap = ({
             <p className="text-[0.65rem] tracking-wide text-accent uppercase">{KIND_LABEL[chosen.kind]}</p>
             <p className="font-display text-base">{chosen.name}</p>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{chosen.note}</p>
+            {chosen.kind === 'shore' && (
+              <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+                Đi xuống cầu bến, tới sát thuyền rồi nhấn E hoặc chạm nút tương tác để lên thuyền.
+              </p>
+            )}
             {player && (
               <p className="mt-1 text-[0.7rem] text-subtle">
                 cách bạn {formatDistance(Math.hypot(chosen.x - player.x, chosen.z - player.z))}
@@ -1242,10 +1301,11 @@ export const WorldMap = ({
             <div className="mt-2 flex gap-2">
               <button
                 type="button"
-                disabled={!canTravel}
+                disabled={!canTravel || (chosen.kind === 'parking' && !onTravelToParking)}
                 title={canTravel ? undefined : 'Bật “Đi bộ” để tới đây'}
                 onClick={() => {
-                  onTravel(chosen.id);
+                  if (chosen.kind === 'parking') onTravelToParking?.(chosen.x, chosen.z);
+                  else onTravel(chosen.id);
                   onClose();
                 }}
                 className="h-11 rounded-control border border-accent/60 px-3 text-xs text-accent transition-colors hover:border-accent disabled:opacity-50"

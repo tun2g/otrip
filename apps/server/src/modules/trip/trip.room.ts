@@ -3,7 +3,7 @@ import { Room, ServerError, type Client } from 'colyseus';
 
 import { loadConfig } from '../../config/configuration.ts';
 import { Player, TripState } from './trip.schema.ts';
-import { findSpawn, isSpawnable } from '../../shared/spawn.ts';
+import { findSpawn } from '../../shared/spawn.ts';
 import { worldFor } from '../../shared/terrain-cache.ts';
 
 const config = loadConfig();
@@ -40,7 +40,7 @@ const MAX_MESSAGES_PER_SECOND = 30;
 
 type MoveMessage = { x?: unknown; z?: unknown; yaw?: unknown };
 type ChatMessage = { text?: unknown };
-type JoinOptions = { name?: unknown; spawn?: unknown };
+type JoinOptions = { name?: unknown; location?: unknown; spawn?: unknown };
 
 const clamp = (value: number, min: number, max: number): number => Math.min(max, Math.max(min, value));
 
@@ -59,12 +59,13 @@ const cleanText = (value: unknown, limit: number): string =>
 
 const cleanName = (value: unknown): string => cleanText(value, MAX_NAME) || 'Khách';
 
-/** Where the client says it put you, if that is somewhere a person could stand. */
-const readSpawn = (value: unknown, terrain: Terrain, waterLevel: number): { x: number; z: number } | null => {
+/** A visitor can join after exploring, including on a bridge or in the water. */
+const readSpawn = (value: unknown, terrain: Terrain): { x: number; z: number } | null => {
   if (typeof value !== 'object' || value === null) return null;
   const { x, z } = value as { x?: unknown; z?: unknown };
   if (typeof x !== 'number' || typeof z !== 'number') return null;
-  return isSpawnable(terrain, waterLevel, x, z) ? { x, z } : null;
+  const half = terrain.size / 2;
+  return Number.isFinite(x) && Number.isFinite(z) && Math.abs(x) <= half && Math.abs(z) <= half ? { x, z } : null;
 };
 
 export class TripRoom extends Room {
@@ -75,6 +76,7 @@ export class TripRoom extends Room {
   private terrain: Terrain | null = null;
   private waterLevel = Number.NEGATIVE_INFINITY;
   private lastMove = new Map<string, { at: number; x: number; z: number }>();
+  private lastRelocate = new Map<string, number>();
   private chatAllowance = new Map<string, { lines: number; at: number }>();
 
   onCreate(options: { location?: unknown }) {
@@ -91,14 +93,18 @@ export class TripRoom extends Room {
     this.setPrivate(true);
 
     this.onMessage('move', (client, message: MoveMessage) => this.handleMove(client, message));
+    this.onMessage('relocate', (client, message: MoveMessage) => this.handleRelocate(client, message));
     this.onMessage('chat', (client, message: ChatMessage) => this.handleChat(client, message));
   }
 
   onJoin(client: Client, options: JoinOptions) {
     const terrain = this.terrain;
     if (!terrain) throw new ServerError(500, 'Phòng chưa sẵn sàng');
+    if (options?.location && options.location !== this.state.location) {
+      throw new ServerError(400, 'Link mời không đúng địa điểm của phòng');
+    }
 
-    const spawn = readSpawn(options?.spawn, terrain, this.waterLevel) ?? findSpawn(terrain, this.waterLevel);
+    const spawn = readSpawn(options?.spawn, terrain) ?? findSpawn(terrain, this.waterLevel);
 
     const player = new Player();
     player.name = cleanName(options?.name);
@@ -127,6 +133,7 @@ export class TripRoom extends Room {
     this.state.players.delete(client.sessionId);
     this.lastMove.delete(client.sessionId);
     this.chatAllowance.delete(client.sessionId);
+    this.lastRelocate.delete(client.sessionId);
   }
 
   /**
@@ -168,6 +175,24 @@ export class TripRoom extends Room {
     // Wrapped into one turn rather than passed through: this rotates a remote
     // avatar, and a client is free to send 1e300.
     player.yaw = Math.atan2(Math.sin(yaw), Math.cos(yaw));
+  }
+
+  /** Fast travel is an explicit action, not a stream of impossible walk packets. */
+  private handleRelocate(client: Client, message: MoveMessage) {
+    const player = this.state.players.get(client.sessionId);
+    const terrain = this.terrain;
+    if (!player || !terrain) return;
+    const now = Date.now();
+    if (now - (this.lastRelocate.get(client.sessionId) ?? 0) < 500) return;
+    const x = message?.x;
+    const z = message?.z;
+    if (typeof x !== 'number' || typeof z !== 'number' || !Number.isFinite(x) || !Number.isFinite(z)) return;
+    if (Math.abs(x) > terrain.size / 2 || Math.abs(z) > terrain.size / 2) return;
+    this.lastRelocate.set(client.sessionId, now);
+    player.x = x;
+    player.z = z;
+    player.y = terrain.heightAt(x, z);
+    this.lastMove.set(client.sessionId, { at: now, x, z });
   }
 
   private handleChat(client: Client, message: ChatMessage) {

@@ -67,6 +67,11 @@ export const SceneCanvas = ({
   onLockChange,
 }: SceneCanvasProps) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const walkingRef = useRef(walking);
+  const savedPosition = useRef<{ slug: string; x: number; z: number } | null>(null);
+  useEffect(() => {
+    walkingRef.current = walking;
+  }, [walking]);
   const [status, setStatus] = useState<SceneStatus>('loading');
   const [renderer, setRenderer] = useState<WorldRenderer | null>(null);
 
@@ -88,7 +93,15 @@ export const SceneCanvas = ({
       .then(([{ createWorldRenderer }, sources, humanSource]) => {
         if (disposed) return;
         const instance = createWorldRenderer(canvas, recipe, tier, style, sources, humanSource);
-        dispose = instance.dispose;
+        const saved = savedPosition.current;
+        if (saved?.slug === recipe.slug) {
+          instance.setWalking(true);
+          instance.travelToPosition(saved.x, saved.z);
+        }
+        dispose = () => {
+          if (walkingRef.current) savedPosition.current = { slug: recipe.slug, ...instance.localPosition() };
+          instance.dispose();
+        };
         setRenderer(instance);
         setStatus('ready');
       })
