@@ -16,3 +16,8 @@ docs
 # 160MB nhạc gốc chưa xử lý. Bản đã cắt và nén nằm trong apps/web/public/audio,
 # nguồn tải lại được theo assets/CREDITS.md nên không cần vào image.
 assets/audio/raw
+assets/models/raw
+scratchpad
+**/.env
+**/.env.*
+**/*.tsbuildinfo

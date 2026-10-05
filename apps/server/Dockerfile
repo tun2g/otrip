@@ -14,6 +14,7 @@ RUN corepack enable
 WORKDIR /app
 
 FROM base AS deps
+ENV HUSKY=0
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json tsconfig.base.json .npmrc ./
 COPY apps/server/package.json apps/server/package.json
 COPY apps/web/package.json apps/web/package.json
@@ -23,7 +24,12 @@ COPY packages/world/package.json packages/world/package.json
 RUN pnpm install --frozen-lockfile --filter @otrip/server...
 
 FROM deps AS runner
-COPY . .
+COPY apps/server/src apps/server/src
+COPY packages/world/src packages/world/src
+COPY packages/contracts/src packages/contracts/src
 ENV NODE_ENV=production
+USER node
 EXPOSE 2567
-CMD ["pnpm", "--filter", "@otrip/server", "start:prod"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD wget -q --spider http://127.0.0.1:2567/health || exit 1
+CMD ["node", "--experimental-strip-types", "apps/server/src/main.ts"]

@@ -98,7 +98,29 @@ Thêm một `LocationRecipe` vào `packages/world/src/locations.ts`. Không ph�
 - **Người thật**: nhân vật có khung xương, animation đứng / đi / chạy — cả bạn lẫn dân làng.
 - Âm thanh phản ứng theo thời tiết thật; ảnh preview khi chia sẻ link.
 
+## Deploy
+
+GitHub Actions (`.github/workflows/build.yml`) build hai image Linux amd64 khi push
+lên `main`: `ghcr.io/tun2g/otrip-web` và `ghcr.io/tun2g/otrip-server`, với tag
+`latest` và `sha-<commit>`. Có thể chạy lại bằng `workflow_dispatch`.
+
+Web chạy Next.js standalone; server chạy Node 24. Build context của cả hai
+Dockerfile là thư mục gốc repo. GitHub repository Variables có thể ghi đè:
+
+| Variable                   | Mặc định                      |
+| -------------------------- | ----------------------------- |
+| `NEXT_PUBLIC_SITE_URL`     | `https://otrip.chamee.site`   |
+| `NEXT_PUBLIC_REALTIME_URL` | `wss://otrip-api.chamee.site` |
+
+Hai giá trị được nhúng lúc build, đổi domain cần build lại image.
+
+Cấu hình VPS nằm ở repo `devops`, thư mục `projects/otrip/`. Sau khi tạo env
+từ file mẫu và trỏ DNS, chạy `./deploy.sh pull otrip-web otrip-server`; lần đầu
+cần cập nhật domain và recreate Caddy theo README của repo đó. Kiểm tra web tại
+`https://otrip.chamee.site/` và server tại `https://otrip-api.chamee.site/health`.
+Phòng đi chung lưu trong RAM, khởi động lại server sẽ ngắt các phòng hiện tại.
+
 ## Chưa làm
 
-Deploy (đã có `Dockerfile` cho server, chưa đẩy lên đâu), tài khoản, lưu trữ lâu dài, phòng công khai và
+Tài khoản, lưu trữ lâu dài, phòng công khai và
 bộ máy kiểm duyệt đi kèm. Kế hoạch đầy đủ trong `plans/`.
