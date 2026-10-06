@@ -2,8 +2,10 @@
 
 import { useEffect, useRef, useState } from 'react';
 
+import { companionDistance, directionWords, type Viewpoint } from '@/components/ui/companion-compass';
 import type { Trip } from '@/hooks/use-trip';
 import { cn } from '@/lib/utils';
+import { colourFor, relativeTo } from '@/scene/companion-markers';
 
 type TripPanelProps = {
   trip: Trip;
@@ -14,6 +16,14 @@ type TripPanelProps = {
   onToggleView: () => void;
   onCopyInvite: () => void;
   inviteLabel: string;
+  /**
+   * Where the camera is and which way it looks, or null while browsing. Read at
+   * render time rather than polled: `trip-client.ts` rebuilds the roster on every
+   * state change and the server echoes your own position back, so this panel
+   * already re-renders ten times a second whenever anybody in the room moves —
+   * including you. When nothing moves there is nothing to go stale.
+   */
+  viewpoint?: () => Viewpoint | null;
 };
 
 const CHIP =
@@ -34,6 +44,7 @@ export const TripPanel = ({
   onToggleView,
   onCopyInvite,
   inviteLabel,
+  viewpoint,
 }: TripPanelProps) => {
   const [name, setName] = useState('');
   const [draft, setDraft] = useState('');
@@ -41,6 +52,13 @@ export const TripPanel = ({
   const transcriptRef = useRef<HTMLUListElement | null>(null);
 
   const others = trip.players.length;
+  // "Bạn và 1 người nữa" was the whole of what this panel said about the people
+  // it was counting, which is a number with nothing behind it: the one reader who
+  // could not see their companion was told they had one and given no way to ask
+  // where. On foot each name opens into a distance and a direction; from the
+  // sightseeing camera there is no "you" to measure from, so it stays a roster
+  // and says what to do about it.
+  const here = walking ? (viewpoint?.() ?? null) : null;
 
   // A transcript that keeps the first message on screen is a transcript nobody
   // reads: the newest line is the one being talked about.
@@ -93,14 +111,47 @@ export const TripPanel = ({
 
       {trip.status === 'joined' && (
         <>
-          <div className="mt-2 flex flex-wrap items-center gap-2">
-            <span className="text-muted-foreground">{companyLabel(others)}</span>
-            {trip.roomId && (
-              <span className="rounded-control bg-panel-strong/60 px-2 py-0.5 font-mono text-[0.7rem] tracking-wider text-accent">
+          <p className="mt-2 text-muted-foreground">{companyLabel(others)}</p>
+
+          {others > 0 && (
+            <ul className="mt-1.5 space-y-1">
+              {trip.players.map((person) => {
+                const placed = here && Number.isFinite(person.x) && Number.isFinite(person.z);
+                const bearing = placed ? relativeTo(here, person) : null;
+
+                return (
+                  <li key={person.id} className="flex items-center gap-2">
+                    <span
+                      aria-hidden="true"
+                      className="size-2 shrink-0 rounded-full"
+                      style={{ background: colourFor(person.id) }}
+                    />
+                    <span className="min-w-0 flex-1 truncate text-muted-foreground">{person.name}</span>
+                    {bearing && (
+                      <span className="shrink-0 text-subtle">
+                        {companionDistance(bearing.range)} · {directionWords(bearing.bearing)}
+                      </span>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+
+          {others > 0 && !walking && (
+            <p className="mt-1.5 leading-relaxed text-subtle">
+              Từ trên cao mỗi người chỉ là một vòng tròn nhỏ trên sườn núi. Bấm “Đi bộ” để lại đứng cạnh nhau.
+            </p>
+          )}
+
+          {trip.roomId && (
+            <p className="mt-2 text-subtle">
+              Mã phòng{' '}
+              <span className="rounded-control bg-panel-strong/60 px-1.5 py-0.5 font-mono tracking-wider text-accent">
                 {trip.roomId}
               </span>
-            )}
-          </div>
+            </p>
+          )}
 
           {/* The full invite URL used to be printed here. A room link is a key:
               anyone reading the screen, or a screenshot of it, was in. */}
@@ -114,7 +165,13 @@ export const TripPanel = ({
               </button>
             )}
           </div>
-          <p className="mt-1.5 leading-relaxed text-subtle">Ai có link mời cũng vào được phòng này.</p>
+          {/* The second sentence is the reported bug, written down. Two windows
+              that each pressed "Rủ bạn đi cùng" create two rooms, both correctly
+              reading "Chỉ có bạn", and the code above is the only thing on screen
+              that tells them apart. */}
+          <p className="mt-1.5 leading-relaxed text-subtle">
+            Ai có link mời cũng vào được phòng này. Hai người phải cùng một mã phòng mới thấy nhau.
+          </p>
 
           {leaving && (
             <div className="mt-2 rounded-control border border-accent/40 bg-panel-strong/60 p-2.5">

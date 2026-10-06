@@ -24,7 +24,11 @@ import { createTerraces } from './terraces';
 import { planTown, yieldToClaims } from './town-plan';
 import { createVehicles } from './vehicles';
 import { createWildlife } from './wildlife';
+import { createAvatarRides } from './avatar-ride';
+import { COCKPIT_LAYER } from './vehicle-kit';
+import { chooseSpawn } from './arrival';
 import { createAvatars, type RemotePlayer } from './avatars';
+import { createCompanionMarkers } from './companion-markers';
 import { createCloudSea } from './cloud-sea';
 import { createDayClouds } from './day-clouds';
 import { createDock, findDockSite } from './dock';
@@ -50,15 +54,42 @@ import { createNatureScatter } from './nature-scatter';
 import { createObstacleIndex } from './obstacle-index';
 import { createTownMeshes } from './town-meshes';
 import { CLEAR_WEATHER, blendWeather, type WorldWeather } from './weather-state';
-import { createWalker, type Joystick, type Walker } from './walker';
+import { createWalker, type Joystick, type RideTelemetry, type Walker } from './walker';
 import { createWater } from './water';
 
 /** The five idioms the map draws: four road classes plus the line. */
 export type RouteKind = 'main' | 'secondary' | 'lane' | 'trail' | 'rail';
 
+/** The reference field of view, and what the comfort setting defaults to. */
 const BASE_FOV = 52;
-const BASE_FOV_RADIANS = (BASE_FOV * Math.PI) / 180;
+/**
+ * The cockpit pass's near plane, metres.
+ *
+ * Half the 0.30 m the handlebars sit from the rider's eyes, measured off the rig
+ * by `probe/ride-view.ts` — so the bars clear it rather than graze it, and there
+ * is room for a build that puts a mirror slightly closer.
+ */
+const COCKPIT_NEAR = 0.15;
+
 const REFERENCE_ASPECT = 16 / 9;
+
+/**
+ * The speeds the peripheral mask fades in between, m/s.
+ *
+ * It must do nothing at the pace somebody walks a village at and most of its
+ * work at the pace they cross a map, because vection — the eye reporting
+ * self-motion while the body reports sitting still — is what makes people ill,
+ * and it scales with how fast the periphery is streaming past. The gait ladder
+ * in `walker.ts` runs 1.4 (a stroll) to 4.5 (a jog), so 5 is just above
+ * everything a body does on foot and nothing is masked while exploring. 18 is
+ * above the 14 m/s travel stride and inside the ridden bike's range, so holding
+ * Shift or opening the throttle is where it arrives.
+ */
+const MASK_FROM = 5;
+const MASK_FULL = 18;
+/** Per second the measured speed is eased, so the mask does not flicker with a
+ *  frame hitch or pump on every touch of the brake. */
+const MASK_EASE = 2.5;
 
 /**
  * What the scene shows before the live forecast lands: the sun just up, a full
@@ -111,7 +142,25 @@ const findRidgeViewpoint = (
   return best;
 };
 
-export type LocalMove = { x: number; z: number; yaw: number };
+export type LocalMove = {
+  x: number;
+  z: number;
+  /**
+   * Where the body faces, and — once somebody is riding — where they are
+   * *looking*, which is not the same thing. A rider on a left-hander has the
+   * machine pointed into the bend and their head already down the exit, so the
+   * two are separate numbers in the room's schema and have to be separate here.
+   */
+  yaw: number;
+  /** Where the machine points. Equal to `yaw` on foot. */
+  heading: number;
+  /** m/s, so a companion's wheels can turn without anybody differentiating
+   *  positions that arrive at whatever rate the network manages. */
+  speed: number;
+  /** '' on foot, otherwise the vehicle kind. The field that stops a friend on a
+   *  bike being drawn as a jogger covering 60 m/s. */
+  riding: string;
+};
 
 export type WorldRenderer = {
   applySky: (state: SkyState, weather: WorldWeather) => void;
@@ -121,6 +170,17 @@ export type WorldRenderer = {
   interact: () => void;
   /** True while the walker is aboard a boat — the HUD reads differently afloat. */
   riding: () => boolean;
+  /**
+   * The machine's dash, or null on foot and aboard a hull.
+   *
+   * The walker's own object, handed straight through rather than copied — which
+   * is also the one thing a caller has to know about it. `Walker.telemetry`
+   * rewrites a single hoisted struct and returns it by reference, so the fields
+   * are read out and the object is never kept: held across a frame it goes stale
+   * until the next call and is then overwritten in place. `probe/ride-dash.ts`
+   * measures both halves of that.
+   */
+  telemetry: () => RideTelemetry | null;
   /**
    * Road centrelines in world metres, for the map. Resolved once at build, the
    * way `pois` is, so the HUD's existing poll picks both up in the same tick.
@@ -132,12 +192,43 @@ export type WorldRenderer = {
   setJoystick: (input: Joystick | null) => void;
   setStyle: (style: RenderStyle) => void;
   setSensitivity: (value: number) => void;
+  /**
+   * The comfort preferences, from `use-settings`.
+   *
+   * One call rather than three setters because all three are read from the same
+   * stored object and a partial application is never wanted. `vignette` is the
+   * *ceiling* the peripheral mask reaches at speed, not the value handed to the
+   * shader — the renderer multiplies it by how fast the player is actually
+   * moving, because it is the only layer that knows.
+   */
+  setComfort: (comfort: { cameraMotion: boolean; vignette: number; fov: number }) => void;
   /** Pointer lock state, so the UI can tell people how to get it back. */
   onLockChange: (handler: ((locked: boolean) => void) | null) => void;
   requestLock: () => void;
   toggleView: () => void;
   onViewChange: (handler: ((view: 'first' | 'third') => void) | null) => void;
   onLocalMove: (handler: ((move: LocalMove) => void) | null) => void;
+  /**
+   * Called whenever the local player is *put* somewhere rather than having
+   * walked there: the walker being created, a jump to a landmark, a jump to a
+   * parking spot, a position restored after the world was rebuilt at a new
+   * detail tier.
+   *
+   * It exists because the room has to be told, and telling it was previously the
+   * caller's job to remember. `location-scene.travel()` did remember; the
+   * renderer rebuild did not, and the cost was measured: stop walking, change
+   * the detail tier, walk again, and the new walker starts at the default spawn
+   * while the room still holds the old position. The first `move` packet then
+   * crosses that whole distance in one interval, `handleMove` refuses it on
+   * speed, and because it refuses by a bare `return` nobody is told — about
+   * seven seconds of movement is dropped per 300 m of error, during which the
+   * player looks frozen to everyone else and fine to themselves.
+   *
+   * Announcing it here instead makes the invariant the renderer's own: if the
+   * local player did not walk to where they are, this fires, and there is no
+   * path that can forget.
+   */
+  onPlaced: (handler: ((x: number, z: number) => void) | null) => void;
   /** One frame at an exact size, for the shareable postcard. */
   capture: (width: number, height: number) => Capture;
   /** Places to find, already resolved against this seed's terrain. */
@@ -148,6 +239,18 @@ export type WorldRenderer = {
    * cannot find is the same as no bike at all.
    */
   parking: ParkingSpot[];
+  /**
+   * Where the rides are, live: every parked motorbike and every boat a player
+   * could actually board, with whether somebody is on it.
+   *
+   * The maps had `parking` — the kerb-side slots `road-network` publishes — which
+   * is where a bike *stands*, not where one *is*. The two parted company as soon
+   * as anybody rode one: the slot stayed on the map and the machine was
+   * kilometres away. And a boat was never on the map at all; the "thuyền" entry
+   * was the jetty, which is a place, while the boat is a thing that moves and is
+   * the reason you walk to the place.
+   */
+  rides: () => { id: string; noun: string; x: number; z: number; taken: boolean; atRest: boolean }[];
   setDiscovered: (ids: Set<string>) => void;
   /** Jump to a place already visited. Walking is only required the first time. */
   travelTo: (poiId: string) => void;
@@ -155,6 +258,15 @@ export type WorldRenderer = {
   onDiscover: (handler: ((poi: ResolvedPoi) => void) | null) => void;
   /** Where the walker is, for the compass and the minimap. */
   localPosition: () => { x: number; z: number; yaw: number };
+  /**
+   * Where the walker is and which way the *camera* looks, read fresh.
+   *
+   * Separate from `localPosition` because its `yaw` is the body's, which is
+   * eased toward the direction of travel — right for a minimap arrow showing
+   * which way somebody is walking, wrong for anything telling them which way to
+   * turn their head.
+   */
+  localView: () => { x: number; z: number; yaw: number } | null;
   /** A top-down picture of the terrain, drawn once for the minimap. */
   minimap: (size: number) => ImageData;
   terrainSize: number;
@@ -335,8 +447,11 @@ export const createWorldRenderer = (
   // house ended 114 m from one.
   const townPlan = planTown(terrain, recipe, 1);
 
-  const avatars = createAvatars(humanSource);
-  scene.add(avatars.group);
+  // Where the people you came with are once they are too far off to be people.
+  // Measured: a companion is 0.43 px tall from the sightseeing camera, so the
+  // body and its name label are both a smudge long before they are gone.
+  const companions = createCompanionMarkers();
+  scene.add(companions.group);
 
   // One site, used both for the jetty and for the name that points at it.
   // Letting each side find its own by its own rule is how the "Bến thuyền" POI
@@ -347,7 +462,25 @@ export const createWorldRenderer = (
   const landing = findDockSite(terrain, recipe, townPlan.lots);
   const pois = resolvePois(terrain, recipe, townPlan.lots, landing);
 
-  const roads = createRoadNetwork(terrain, recipe, pois, townPlan.lots);
+  /**
+   * Where the visitor arrives, decided **before** the roads so one row of parked
+   * machines can be laid beside it.
+   *
+   * It costs nothing to move: the search reads the terrain and the first
+   * landmark and nothing else. Only its fallback touches the buildings, and
+   * `yieldToClaims` below moves lots *away* from carriageways, so a spawn
+   * chosen first is if anything further from a wall rather than nearer one.
+   */
+  const spawn = chooseSpawn(
+    terrain,
+    recipe,
+    townPlan.lots,
+    pois,
+    [],
+    findSpawn(terrain, recipe.water?.level ?? Number.NEGATIVE_INFINITY, townPlan.lots)
+  );
+
+  const roads = createRoadNetwork(terrain, recipe, pois, townPlan.lots, spawn);
   scene.add(roads.group);
 
   // Now the carriageway exists, the lots that turned out to be standing on it
@@ -377,6 +510,26 @@ export const createWorldRenderer = (
 
   const vehicles = createVehicles(recipe, roads, settings.vehicles, terrain);
   scene.add(vehicles.group);
+
+  /**
+   * The companions, and the machines whichever of them are riding.
+   *
+   * Made here rather than with the rest of the scene because `createAvatarRides`
+   * borrows the fleet's `kit` — the shared materials and the assembler — so that
+   * a friend's bike comes out of the same pair of shaders as the bus in front of
+   * it and mounting is never the frame that compiles one.
+   *
+   * `rides.group` goes into the scene **beside** `avatars.group` and not inside
+   * it. Two separate reasons, both load-bearing: a machine points where the
+   * machine points while an avatar's group carries the rider's own view yaw, so
+   * it cannot hang off the body; and one child of `avatars.group` means one
+   * player, which is the invariant `probe/avatar-sync.ts` reads `children[0]`
+   * and `children.length` against to answer "is this companion in the room".
+   */
+  const rides = createAvatarRides(vehicles.kit);
+  const avatars = createAvatars(humanSource, rides);
+  scene.add(avatars.group);
+  scene.add(rides.group);
 
   const dock = createDock(terrain, recipe, landing);
   if (dock) scene.add(dock.group);
@@ -496,6 +649,64 @@ export const createWorldRenderer = (
   const focus = cloudSea?.altitude ?? recipe.water?.level ?? viewpoint.y * 0.4;
 
   const camera = new PerspectiveCamera(BASE_FOV, 1, 2, terrain.size * 10);
+
+  /**
+   * The cockpit camera: the same view with a near plane that can see the bars.
+   *
+   * Measured off the assembled rig by `probe/ride-view.ts`, from the seated
+   * figure's eyes: the bars, mirrors and fork are **0.30 m** away and the front
+   * wheel 1.26 m, against the world camera's 2 m near plane. So riding in first
+   * person showed nothing of the machine at all — every part of it was inside the
+   * plane — which is why the view was worth having and not worth much.
+   *
+   * `COCKPIT_NEAR` is 0.15, half the nearest thing it has to show, so the bars are
+   * clear of the plane rather than grazing it.
+   *
+   * It is a second camera rather than a lower `near` on the one camera, and that
+   * is the whole point: with `near` at 0.15 and `far` at ten times a 5,200 m
+   * terrain, the depth buffer resolves about 24 cm at a kilometre instead of 3 cm,
+   * and distant terrain z-fights. The world keeps its 2 m plane and its precision;
+   * the cockpit gets its own pass, its own plane, and a depth buffer cleared in
+   * front of it, which it can afford because a machine you are sitting on is in
+   * front of the entire world by definition.
+   *
+   * `layers` is what it draws: only the rig `vehicles.mount` put on
+   * `COCKPIT_LAYER`, which is the one machine being ridden and never the five
+   * parked along the kerb. Everything else in the scene fails the layer test
+   * before it is ever transformed.
+   */
+  const cockpitCamera = new PerspectiveCamera(BASE_FOV, 1, COCKPIT_NEAR, terrain.size * 10);
+  cockpitCamera.layers.set(COCKPIT_LAYER);
+  /**
+   * Whether the walker last told us the lens is at the eyes.
+   *
+   * Kept here as well as handed on, because the cockpit pass is the renderer's
+   * own business: the view is the walker's to decide and the HUD's to know
+   * about, and this is a third reader of the same event.
+   */
+  let firstPerson = false;
+  const onView = (view: 'first' | 'third') => {
+    firstPerson = view === 'first';
+    viewHandler?.(view);
+  };
+
+  /**
+   * The comfort preferences, and the one place that owns `camera.fov`.
+   *
+   * The walker deliberately does not set an absolute FOV: `resize` below widens
+   * it below a 16:9 aspect so a portrait phone keeps the same width of world in
+   * frame, and an absolute value written from anywhere else would undo that
+   * correction. So the setting is the *reference* FOV the aspect correction is
+   * applied to, which is what `use-settings` documents it as.
+   */
+  let baseFov = BASE_FOV;
+  let cameraMotion = false;
+  let maskStrength = 0;
+  /** Eased metres a second the local player is covering, for the mask. */
+  let shownSpeed = 0;
+  let lastSpeedX = 0;
+  let lastSpeedZ = 0;
+  let speedSeen = false;
   camera.position.set(terrain.size * 0.2, Math.max(viewpoint.y, focus) + terrain.size * 0.12, terrain.size * 0.62);
 
   const controls = new OrbitControls(camera, renderer.domElement);
@@ -517,51 +728,6 @@ export const createWorldRenderer = (
    * see out of it: the ground toward the first landmark must not rear up in the
    * first eighty metres.
    */
-  const spawn = (() => {
-    const waterLevel = recipe.water?.level ?? Number.NEGATIVE_INFINITY;
-    const base = findSpawn(terrain, waterLevel, town.buildings);
-    const first = pois[0];
-    if (!first) return base;
-
-    /** Average ground on a ring, to tell a crest from a hollow. */
-    const ringAverage = (x: number, z: number, radius: number) => {
-      let total = 0;
-      for (let step = 0; step < 8; step += 1) {
-        const angle = (step / 8) * Math.PI * 2;
-        total += terrain.heightAt(x + Math.cos(angle) * radius, z + Math.sin(angle) * radius);
-      }
-      return total / 8;
-    };
-
-    const hasOutlook = (x: number, z: number) => {
-      const eye = terrain.heightAt(x, z) + 2.5;
-      const toward = Math.atan2(first.x - x, first.z - z);
-
-      for (let step = 15; step <= 80; step += 15) {
-        const ahead = terrain.heightAt(x + Math.sin(toward) * step, z + Math.cos(toward) * step);
-        if (ahead > eye + 6) return false;
-      }
-      return true;
-    };
-
-    for (let radius = 260; radius < 900; radius += 45) {
-      for (let step = 0; step < 24; step += 1) {
-        const angle = (step / 24) * Math.PI * 2;
-        const x = first.x + Math.cos(angle) * radius;
-        const z = first.z + Math.sin(angle) * radius;
-        if (Math.abs(x) > terrain.size / 2 - 40 || Math.abs(z) > terrain.size / 2 - 40) continue;
-        if (terrain.heightAt(x, z) <= waterLevel + 2) continue;
-        if (terrain.slopeAt(x, z) > 0.3) continue;
-        // On a crest rather than in a hollow. Standing in a dip on a mountain
-        // means the only thing in frame is the next slope up.
-        if (terrain.heightAt(x, z) < ringAverage(x, z, terrain.size * 0.035) + terrain.maxHeight * 0.02) continue;
-        if (!hasOutlook(x, z)) continue;
-        return { x, z };
-      }
-    }
-
-    return base;
-  })();
 
   let walker: Walker | null = null;
   let walking = false;
@@ -572,7 +738,25 @@ export const createWorldRenderer = (
   let discoverHandler: ((poi: ResolvedPoi) => void) | null = null;
   let viewHandler: ((view: 'first' | 'third') => void) | null = null;
   let onMove: ((move: LocalMove) => void) | null = null;
+  let onPlaced: ((x: number, z: number) => void) | null = null;
   let lastSent = 0;
+
+  /**
+   * Teleports the local player and announces where they ended up.
+   *
+   * The announced position is read back off the walker rather than echoed from
+   * the arguments, because `teleport` does not necessarily honour them: it
+   * resolves the landing point out of whatever it arrived inside — a trunk, a
+   * station platform, a wall — and lands on the floor it finds there. Echoing
+   * the request would hand the room a position the player is not standing at,
+   * which is the same desync this is here to prevent, arrived at from the other
+   * direction.
+   */
+  const placeAt = (x: number, z: number) => {
+    if (!walker) return;
+    walker.teleport(x, z);
+    onPlaced?.(walker.position.x, walker.position.z);
+  };
 
   const presentPass = createPresentPass(settings.renderScale, style, settings.sunShafts);
 
@@ -635,6 +819,7 @@ export const createWorldRenderer = (
     town.setNight(night01);
     life.setNight(night01);
     walker?.setNight(night01);
+    companions.setNight(night01);
     roads.setNight(night01);
     railway.setNight(night01);
     aircraft.setNight(night01);
@@ -735,11 +920,19 @@ export const createWorldRenderer = (
     camera.aspect = aspect;
     // On a portrait phone a fixed vertical FOV crops the range off both sides.
     // Widening it below the reference aspect keeps the same width in frame.
+    const reference = (baseFov * Math.PI) / 180;
     camera.fov =
       aspect < REFERENCE_ASPECT
-        ? Math.min(88, (2 * Math.atan(Math.tan(BASE_FOV_RADIANS / 2) * (REFERENCE_ASPECT / aspect)) * 180) / Math.PI)
-        : BASE_FOV;
+        ? Math.min(88, (2 * Math.atan(Math.tan(reference / 2) * (REFERENCE_ASPECT / aspect)) * 180) / Math.PI)
+        : baseFov;
     camera.updateProjectionMatrix();
+    // The cockpit shares everything but `near`: same FOV after the portrait
+    // widening, same aspect. Copied rather than recomputed, so the comfort
+    // setting and the phone-shape correction cannot apply to one and not the
+    // other and leave the bars at a different focal length from the road.
+    cockpitCamera.fov = camera.fov;
+    cockpitCamera.aspect = aspect;
+    cockpitCamera.updateProjectionMatrix();
     renderer.setSize(width, height, false);
     presentPass.setSize(width * renderer.getPixelRatio(), height * renderer.getPixelRatio());
   };
@@ -760,11 +953,52 @@ export const createWorldRenderer = (
 
     if (walking && walker) {
       walker.update(delta, camera);
+
+      /**
+       * How fast the player is going, measured rather than asked for.
+       *
+       * The walker's own `groundSpeed` is private and a ride integrates its
+       * speed separately, so differencing the position is the one reading that
+       * covers walking, travelling, swimming and riding without the walker
+       * having to publish a number for each. It is also the honest quantity for
+       * the mask: what matters is how fast the world is streaming past, not what
+       * the machine's throttle was asked for.
+       *
+       * Eased, because the raw per-frame difference is noisy enough to make the
+       * mask breathe, and a mask that breathes is its own motion cue.
+       */
+      if (speedSeen && delta > 0) {
+        const covered = Math.hypot(walker.position.x - lastSpeedX, walker.position.z - lastSpeedZ) / delta;
+        // A teleport is not a speed. `walker.teleport` can move the body
+        // kilometres in one frame, and without this the mask would black the
+        // frame out on arrival at a landmark.
+        const sane = covered < 60 ? covered : shownSpeed;
+        shownSpeed += (sane - shownSpeed) * (1 - Math.exp(-delta * MASK_EASE));
+      }
+      lastSpeedX = walker.position.x;
+      lastSpeedZ = walker.position.z;
+      speedSeen = true;
       // Ten updates a second is plenty for people strolling, and keeps well
       // clear of the server's rate expectations.
       if (now - lastSent > 100) {
         lastSent = now;
-        onMove?.({ x: walker.position.x, z: walker.position.z, yaw: walker.yaw });
+        // `telemetry()` is null on foot and aboard a hull, and non-null exactly
+        // when a machine is being ridden — which is also the only case
+        // `avatar-ride` draws, so it is the honest test for all three fields.
+        const dash = walker.telemetry();
+        onMove?.({
+          x: walker.position.x,
+          z: walker.position.z,
+          yaw: dash ? walker.viewYaw : walker.yaw,
+          heading: walker.yaw,
+          speed: dash ? dash.speed : 0,
+          // The kind, not the noun: the room bounds this as `[a-z][a-z-]{0,23}`,
+          // which 'xe máy' fails on both the space and the accent, and
+          // `avatar-ride.claim` matches it against `VehicleKind`. Every machine
+          // in the world is a xe máy today; when that stops being true this has
+          // to come off the rideable rather than be decided here.
+          riding: dash ? 'motorbike' : '',
+        });
 
         for (const poi of pois) {
           if (discovered.has(poi.id)) continue;
@@ -849,7 +1083,48 @@ export const createWorldRenderer = (
     // Dusk, not darkness: they come out as the light goes and thin out later.
     fireflies.update(elapsed, Math.min(1, Math.max(0, (1 - toSky.daylight) * (1 - weather.skyOcclusion * 0.6))));
     markers.update(elapsed, walker ? { x: walker.position.x, z: walker.position.z } : undefined);
+    // The camera, not the walker: how big a ring has to be drawn is a question
+    // about the lens, and in sightseeing mode the two are kilometres apart.
+    companions.update(elapsed, camera.position);
     skyDome.tick(elapsed);
+
+    // Off entirely while orbiting the diorama: the camera is kilometres up and
+    // moving at the pace of a dragged mouse, so there is no vection to suppress
+    // and a dark border would only be a border.
+    const pace = Math.min(1, Math.max(0, (shownSpeed - MASK_FROM) / (MASK_FULL - MASK_FROM)));
+    presentPass.setVignette(walking && walker ? maskStrength * pace * pace * (3 - 2 * pace) : 0);
+
+    /**
+     * The cockpit, when there is one to draw.
+     *
+     * Only astride a machine and only with the lens at the rider's eyes, which
+     * are the two conditions under which any of the machine is both in front of
+     * the camera and inside the world's own near plane. Off the rest of the time
+     * and off entirely while orbiting the diorama, so the common case costs one
+     * boolean and the pass is never set up.
+     *
+     * The transform is copied rather than rebuilt: the world camera has already
+     * been positioned, aimed and — if the comfort setting allows it — rolled by
+     * the machine's lean, and the cockpit has to agree with all three or the bars
+     * will sit at an angle to the road they are on. Copying the quaternion takes
+     * the roll with it.
+     */
+    const cockpit = walking && walker !== null && walker.riding() && firstPerson && walker.telemetry() !== null;
+    if (cockpit) {
+      cockpitCamera.position.copy(camera.position);
+      cockpitCamera.quaternion.copy(camera.quaternion);
+      // `capture` reframes `camera` to the postcard's shape and puts it back, so
+      // the aspect and the field are read here rather than trusted from `resize`.
+      if (cockpitCamera.fov !== camera.fov || cockpitCamera.aspect !== camera.aspect) {
+        cockpitCamera.fov = camera.fov;
+        cockpitCamera.aspect = camera.aspect;
+        cockpitCamera.updateProjectionMatrix();
+      }
+      presentPass.setOverlay((target) => target.render(scene, cockpitCamera));
+    } else {
+      presentPass.setOverlay(null);
+    }
+
     presentPass.render(renderer, scene, camera);
   };
   tick();
@@ -859,6 +1134,7 @@ export const createWorldRenderer = (
     prompt: () => walker?.prompt() ?? null,
     interact: () => walker?.interact(),
     riding: () => walker?.riding() ?? false,
+    telemetry: () => walker?.telemetry() ?? null,
     routes,
     setWalking: (enabled) => {
       walking = enabled;
@@ -897,15 +1173,48 @@ export const createWorldRenderer = (
             rideables: () => [...life.rideables(), ...vehicles.rideables()],
             // A getter, not the array: `update` refills it in place every frame.
             nearCrowns: () => nearTrees.crowns,
+            /**
+             * Everything that moves and can be hit: the NPC fleet, and whichever
+             * companions in the room are riding.
+             *
+             * A list of getters rather than one merged array, because each source
+             * rewrites its bodies in place every frame and concatenating them
+             * sixty times a second to hand them over is the one thing a
+             * per-frame getter must not do.
+             *
+             * This is what the user was reporting as "chưa xử lý va chạm giữa
+             * các xe": every piece of it — the impulse, the bodies, the fleet's
+             * own braking — existed and none of it was connected, so a rider
+             * drove through the fleet and through their friends.
+             */
+            traffic: [vehicles.traffic, rides.traffic],
           }
         );
+        /**
+         * And the other direction: the fleet is told where the player is, so it
+         * brakes rather than driving through them.
+         *
+         * A body rather than a ride, which is why `Walker.body` reports the
+         * shoulders and 75 kg on foot as well as the machine's own box astride
+         * one — a coach driving through somebody standing in the lane is the same
+         * bug as a coach driving through somebody on a bike, and the user named
+         * both. Read through the getter every tick because the walker rewrites
+         * one hoisted `Impactor` in place.
+         */
+        vehicles.watch(() => walker?.body() ?? null);
         walker.setJoystick(joystick);
         walker.setSensitivity(sensitivity);
+        walker.setCameraMotion(cameraMotion);
         walker.onLockChange(lockHandler);
-        walker.onViewChange(viewHandler);
+        walker.onViewChange(onView);
         scene.add(walker.group);
         // World space, not a child of the walker, so it is added separately.
         if (walker.waterEffects) scene.add(walker.waterEffects);
+        // A walker is created once, at a spawn with a couple of metres of random
+        // scatter on it, and the room has to be told where that landed —
+        // especially when the world has just been rebuilt at a new detail tier
+        // and the room is still holding the position from before.
+        onPlaced?.(walker.position.x, walker.position.z);
       }
       if (walker) {
         walker.group.visible = enabled;
@@ -925,12 +1234,26 @@ export const createWorldRenderer = (
         controls.update();
       }
     },
-    setRemotePlayers: (players) => avatars.sync(players),
+    setRemotePlayers: (players) => {
+      avatars.sync(players);
+      companions.sync(players);
+    },
     setJoystick: (input) => {
       joystick = input;
       walker?.setJoystick(input);
     },
     setStyle: (next) => presentPass.setStyle(next),
+    setComfort: (comfort) => {
+      cameraMotion = comfort.cameraMotion;
+      walker?.setCameraMotion(comfort.cameraMotion);
+      maskStrength = Math.min(1, Math.max(0, comfort.vignette));
+      // Only on a real change: `resize` rebuilds the projection matrix, and this
+      // arrives on every settings render.
+      if (Number.isFinite(comfort.fov) && comfort.fov !== baseFov) {
+        baseFov = comfort.fov;
+        resize();
+      }
+    },
     setSensitivity: (value) => {
       sensitivity = value;
       walker?.setSensitivity(value);
@@ -943,18 +1266,37 @@ export const createWorldRenderer = (
     toggleView: () => walker?.toggleView(),
     onViewChange: (handler) => {
       viewHandler = handler;
-      walker?.onViewChange(handler);
+      // `onView`, not `handler`: the renderer needs the view for the cockpit
+      // pass as well, and registering the caller's handler directly here is what
+      // replaced the wrapper and left the cockpit on in third person.
+      walker?.onViewChange(onView);
     },
     onLocalMove: (handler) => {
       onMove = handler;
+    },
+    onPlaced: (handler) => {
+      onPlaced = handler;
     },
     pois,
     parking: roads.parking,
     travelTo: (poiId) => {
       const poi = pois.find((entry) => entry.id === poiId);
-      if (poi && walker) walker.teleport(poi.x, poi.z + 30);
+      if (poi && walker) placeAt(poi.x, poi.z + 30);
     },
-    travelToPosition: (x, z) => walker?.teleport(x, z),
+    travelToPosition: (x, z) => placeAt(x, z),
+    rides: () =>
+      [...life.rideables(), ...vehicles.rideables()].map((ride) => ({
+        id: ride.id,
+        noun: ride.noun,
+        x: ride.position.x,
+        z: ride.position.z,
+        // The one the player is on is not one they can go and find. `walker.riding`
+        // only says whether they are on something, so this is the identity test.
+        taken: walker !== null && walker.riding() && ride.id === walker.ridingId(),
+        // A bike at its stand or a boat made fast. A hull under way is a ride
+        // nobody can walk to, so a map must not offer it as one.
+        atRest: ride.atRest?.() ?? true,
+      })),
     setDiscovered: (ids) => {
       discovered = new Set(ids);
       markers.setDiscovered(discovered);
@@ -999,6 +1341,7 @@ export const createWorldRenderer = (
 
       return image;
     },
+    localView: () => (walker ? { x: walker.position.x, z: walker.position.z, yaw: walker.viewYaw } : null),
     localPosition: () => ({
       x: walker?.position.x ?? 0,
       z: walker?.position.z ?? 0,
@@ -1011,7 +1354,7 @@ export const createWorldRenderer = (
       const previousFov = camera.fov;
 
       camera.aspect = width / height;
-      camera.fov = BASE_FOV;
+      camera.fov = baseFov;
       camera.updateProjectionMatrix();
 
       const capture = presentPass.capture(renderer, scene, camera, width, height);
@@ -1024,7 +1367,10 @@ export const createWorldRenderer = (
     },
     dispose: () => {
       walker?.dispose();
+      // Before the fleet: `avatars.dispose` releases the rides, whose rigs were
+      // merged by the fleet's kit and are freed when the fleet is.
       avatars.dispose();
+      companions.dispose();
       cancelAnimationFrame(frame);
       observer.disconnect();
       controls.dispose();

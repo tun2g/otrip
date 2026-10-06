@@ -8,6 +8,8 @@ import { SceneCanvas } from '@/components/scene/scene-canvas';
 import { ActionPrompt } from '@/components/ui/action-prompt';
 import { AudioControls } from '@/components/ui/audio-controls';
 import { NightNotice } from '@/components/ui/night-notice';
+import { CompanionCompass } from '@/components/ui/companion-compass';
+import { RideDash } from '@/components/ui/ride-dash';
 import { ControlHints, LocationCard } from '@/components/ui/scene-hud';
 import { PanelTabs, type PanelTab } from '@/components/ui/panel-tabs';
 import { PauseMenu } from '@/components/ui/pause-menu';
@@ -18,7 +20,9 @@ import { ExplorePanel, type Heading } from '@/components/ui/explore-panel';
 import { Minimap } from '@/components/ui/minimap';
 import { SettingsPanel } from '@/components/ui/settings-panel';
 import { WorldMap, useRelief, type MapRoute } from '@/components/ui/world-map';
+import type { MapRide } from '@/components/ui/map-symbols';
 import { TripPanel } from '@/components/ui/trip-panel';
+import { inviteUrl as buildInviteUrl, readRoomId } from '@/lib/trip-client';
 import { useAudio } from '@/hooks/use-audio';
 import { useForecast } from '@/hooks/use-forecast';
 import { useExploration } from '@/hooks/use-exploration';
@@ -33,6 +37,7 @@ import {
   applyWeatherPreset,
   presetSkyConditions,
   effectivePreset,
+  isPresetId,
   type WeatherPresetId,
 } from '@/lib/weather-presets';
 import { formatHour, goldenHourIndex, hourToDate, todayAt, weatherLabel } from '@/lib/forecast';
@@ -40,7 +45,6 @@ import type { Joystick } from '@/scene/walker';
 import type { ResolvedPoi } from '@/scene/points-of-interest';
 import type { WorldWeather } from '@/scene/weather-state';
 import type { LocalMove, WorldRenderer } from '@/scene/world-renderer';
-import type { ParkingSpot } from '@/scene/road-network';
 
 /**
  * Wall-clock seconds spent on each forecast hour while the clock runs. The
@@ -85,12 +89,23 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
   const [hintVisible, setHintVisible] = useState(true);
   const [photoLabel, setPhotoLabel] = useState('Chụp ảnh');
   const [remindLabel, setRemindLabel] = useState('Nhắc tôi');
-  const [playing, setPlaying] = useState(false);
-  const [preset, setPreset] = useState<WeatherPresetId>(DEFAULT_WEATHER_PRESET);
-  const [speedStep, setSpeedStep] = useState(1);
+  const [localPlaying, setLocalPlaying] = useState(false);
+  const [localPreset, setLocalPreset] = useState<WeatherPresetId>(DEFAULT_WEATHER_PRESET);
+  const [localSpeedStep, setLocalSpeedStep] = useState(1);
   const rendererRef = useRef<WorldRenderer | null>(null);
   const [pois, setPois] = useState<ResolvedPoi[]>([]);
-  const [parking, setParking] = useState<ParkingSpot[]>([]);
+  /**
+   * Where the rides actually are, polled live.
+   *
+   * It was `renderer.parking` — the kerb-side slots `road-network` publishes,
+   * resolved once at build. Those are where a bike *stands*, not where one is,
+   * and the two part company the moment anybody rides one away: the slot keeps
+   * its pin and the machine is kilometres off. It was also the wrong count by
+   * 3.3×, because the maps drew one pin per slot and a row is four slots — a
+   * player's screenshot of Hồ Tây showed pins numbered to "Điểm lấy xe máy 20"
+   * for six bikes, fourteen of them empty kerb.
+   */
+  const [rides, setRides] = useState<readonly MapRide[]>([]);
   const [routes, setRoutes] = useState<MapRoute[]>([]);
   const [player, setPlayer] = useState<{ x: number; z: number; yaw: number } | null>(null);
   const [prompt, setPrompt] = useState<string | null>(null);
@@ -99,8 +114,20 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
   // Shared with the full map, so opening it costs nothing.
   const relief = useRelief(recipe);
 
+  /**
+   * The comfort preferences as one value with a stable identity.
+   *
+   * `setComfort` rebuilds the projection matrix when the field of view changes,
+   * and the effect that calls it depends on this object — so a fresh literal on
+   * every render would rebuild it on every render. The three fields are what the
+   * memo watches, so it changes exactly when one of them does.
+   */
+  const comfort = useMemo(
+    () => ({ cameraMotion: settings.cameraMotion, vignette: settings.vignette, fov: settings.fov }),
+    [settings.cameraMotion, settings.vignette, settings.fov]
+  );
+
   const goldenIndex = useMemo(() => (forecast ? goldenHourIndex(forecast, nowIndex) : null), [forecast, nowIndex]);
-  const index = picked ?? nowIndex;
 
   // The forecast hour the next real sunrise falls in. `goldenHourIndex` is a
   // different question — the best-scoring hour in the three hours after a
@@ -120,7 +147,75 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
     return null;
   }, [forecast, nowIndex]);
 
+  /**
+   * Who decides what hour it is, what the weather is doing and whether the clock
+   * is running: the room, when there is one.
+   *
+   * Two friends standing in the same place were standing in it at different
+   * times of day, under different weather, with one of them watching the light
+   * move and the other not. The room now carries all three, and it is the
+   * authority while you are in one — last writer wins, with no host, because the
+   * social unit here is a few people who already know each other.
+   */
+  const inRoom = trip.status === 'joined';
+
+  /**
+   * One tick a second while the room's clock runs, and nothing otherwise.
+   *
+   * The shared hour is *derived* from an anchor rather than stepped on a local
+   * interval — that is what makes two clients agree instead of merely both run,
+   * since each browser's own interval starts whenever its page happened to load
+   * and the two can sit a whole forecast hour apart. Deriving it means something
+   * has to re-read it, which is all this is.
+   */
+  const [roomTick, setRoomTick] = useState(0);
+  useEffect(() => {
+    if (!inRoom || !trip.world.playing) return;
+    const timer = window.setInterval(() => setRoomTick((value) => value + 1), 1000);
+    return () => window.clearInterval(timer);
+  }, [inRoom, trip.world.playing]);
+
+  const playing = inRoom ? trip.world.playing : localPlaying;
+  const speedStep = inRoom ? (SPEEDS[trip.world.speedStep] === undefined ? 1 : trip.world.speedStep) : localSpeedStep;
   const secondsPerHour = SPEEDS[speedStep] ?? 40;
+
+  /**
+   * The hour the room is in, or null when nobody has pinned one and it is
+   * following the destination's own.
+   *
+   * Carried as the forecast's stamp and not as an index, for the reason the
+   * `?luc=` handling below already records: the 48-hour window is anchored at
+   * the destination's midnight, so an index pinned one evening points at a
+   * different hour by morning.
+   */
+  const roomIndex = useMemo<number | null>(() => {
+    if (!inRoom || !forecast || !trip.world.hourStamp) return null;
+    const base = forecast.hours.findIndex((hour) => hour.time === trip.world.hourStamp);
+    if (base < 0) return null;
+    if (!trip.world.playing) return base;
+    const stepped = Math.floor((trip.serverNow() - trip.world.anchorAt) / 1000 / secondsPerHour);
+    return Math.min(forecast.hours.length - 1, base + Math.max(0, stepped));
+    // `roomTick` is the dependency that makes a running clock advance; it is read
+    // nowhere in the body and that is deliberate.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inRoom, forecast, trip.world, trip.serverNow, secondsPerHour, roomTick]);
+
+  /**
+   * The hour on screen: the room's if there is one, then this machine's own pin,
+   * then whatever hour the place is really living in.
+   */
+  /**
+   * The weather everyone in the room is being shown. The picker is "a lie by
+   * design" and two people should at least be told the same lie.
+   *
+   * An unknown id from the room falls back to this machine's own choice rather
+   * than to the default: the preset table is a browser file the server has never
+   * seen, so a client on a newer build can legitimately name one this one does
+   * not have, and blanking the sky for that is worse than disagreeing about it.
+   */
+  const preset: WeatherPresetId = inRoom && isPresetId(trip.world.preset) ? trip.world.preset : localPreset;
+
+  const index = roomIndex ?? picked ?? nowIndex;
 
   // Everything that runs off a timer reads these from here, so that neither
   // advancing an hour nor the hourly refetch nor the real hour turning over can
@@ -129,6 +224,19 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
   useEffect(() => {
     liveRef.current = { forecast, nowIndex, index };
   }, [forecast, nowIndex, index]);
+
+  /**
+   * The room, for the callbacks that must not be rebuilt when it changes.
+   *
+   * `select` is memoised with no dependencies — deliberately, because the
+   * timers below hold it and rebuilding it would tear an interval down and
+   * reset the wait somebody is sitting through. A ref is how it reaches the room
+   * without taking that back.
+   */
+  const roomRef = useRef({ inRoom: false, setHour: trip.setHour, setClock: trip.setClock });
+  useEffect(() => {
+    roomRef.current = { inRoom, setHour: trip.setHour, setClock: trip.setClock };
+  }, [inRoom, trip.setHour, trip.setClock]);
 
   const select = useCallback((next: number) => {
     const { forecast, nowIndex } = liveRef.current;
@@ -142,6 +250,10 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
     // a past hour while the badge beside it still read "đang diễn ra".
     const following = next === nowIndex;
     setPicked(following ? null : next);
+    // In a room the hour belongs to the room, so it goes there as the forecast's
+    // own stamp. `null` hands it back to the destination's real hour, which is
+    // what choosing "bây giờ" means.
+    if (roomRef.current.inRoom) roomRef.current.setHour(following ? null : hour.time);
 
     const url = new URL(window.location.href);
     if (following) url.searchParams.delete('luc');
@@ -166,10 +278,20 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
     else select(nowIndex);
   }, [forecast, nowIndex, select]);
 
-  // An invite link lands here with a room id; joining it is the whole point of
-  // the link, so do it without making the guest hunt for a button.
+  /**
+   * A room id in the URL lands here and is joined without making anybody hunt
+   * for a button.
+   *
+   * It is now the page's *own* URL and not only a link somebody was sent:
+   * `useTrip` writes `?r=` into the address bar the moment there is a room, so a
+   * reload rejoins and a second window opened on the same URL joins rather than
+   * creating. That last part was a trap worth closing — a join with no room id
+   * calls `client.create`, so two windows that each pressed "Rủ bạn đi cùng"
+   * ended up in two different rooms, both correctly reading "Chỉ có bạn", and
+   * the only path that ever shared a room was the copied invite link.
+   */
   useEffect(() => {
-    const invited = new URLSearchParams(window.location.search).get('phong');
+    const invited = readRoomId();
     if (!invited || inviteHandled.current) return;
     inviteHandled.current = true;
     let remembered = 'Khách';
@@ -268,7 +390,10 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
   const audio = useAudio(recipe.audio.ambience, recipe.audio.music, layers);
 
   useEffect(() => {
-    if (!playing) return;
+    // In a room the hour is derived from the room's anchor, so stepping it here
+    // as well would advance it twice — and the two would disagree, because this
+    // interval starts whenever this page loaded.
+    if (!playing || inRoom) return;
 
     const timer = window.setInterval(() => {
       const { forecast, index } = liveRef.current;
@@ -284,7 +409,42 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
     }, secondsPerHour * 1000);
 
     return () => window.clearInterval(timer);
-  }, [playing, secondsPerHour, select]);
+  }, [playing, inRoom, secondsPerHour, select]);
+
+  /** The stamp of whatever hour is on screen. `setClock` has to carry it: pausing
+   *  without restating it snaps everybody back to the hour play started from. */
+  const showingStamp = useCallback(() => liveRef.current.forecast?.hours[liveRef.current.index]?.time ?? null, []);
+
+  const setPlaying = useCallback(
+    (value: boolean) => {
+      if (inRoom) {
+        trip.setClock(value, speedStep, showingStamp());
+        return;
+      }
+      setLocalPlaying(value);
+    },
+    [inRoom, trip.setClock, speedStep, showingStamp]
+  );
+
+  const cycleSpeed = useCallback(() => {
+    const next = (speedStep + 1) % SPEEDS.length;
+    if (inRoom) {
+      trip.setClock(playing, next, showingStamp());
+      return;
+    }
+    setLocalSpeedStep(next);
+  }, [inRoom, trip.setClock, speedStep, playing, showingStamp]);
+
+  const choosePreset = useCallback(
+    (next: WeatherPresetId) => {
+      // Local as well as remote: the room echoes back in a few tens of
+      // milliseconds, and the picker should not sit on the old answer until it
+      // does. `inRoom` then prefers the room's, so they converge rather than fight.
+      setLocalPreset(next);
+      if (inRoom) trip.setPreset(next);
+    },
+    [inRoom, trip.setPreset]
+  );
 
   const togglePlay = useCallback(() => {
     if (playing) {
@@ -325,12 +485,13 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
     [copy, recipe.name]
   );
 
-  const inviteUrl = useMemo(() => {
-    if (typeof window === 'undefined' || !trip.roomId) return null;
-    const url = new URL(window.location.href);
-    url.searchParams.set('phong', trip.roomId);
-    return url.toString();
-  }, [trip.roomId]);
+  // Built from the page's own URL, so whatever hour is pinned in `?luc=` travels
+  // with the invitation. The key and what counts as an id live with the
+  // transport, which is the file that puts the id into `joinById`.
+  const inviteUrl = useMemo(
+    () => (typeof window === 'undefined' || !trip.roomId ? null : buildInviteUrl(trip.roomId)),
+    [trip.roomId]
+  );
 
   const copyInvite = useCallback(() => {
     if (!inviteUrl) return;
@@ -346,7 +507,7 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
       } catch {
         // Private browsing: the trip still works, the name just is not kept.
       }
-      const roomId = new URLSearchParams(window.location.search).get('phong') ?? undefined;
+      const roomId = readRoomId() ?? undefined;
       setPendingTrip({ name, roomId });
     },
     [trip]
@@ -361,7 +522,6 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
       const renderer = rendererRef.current;
       if (!renderer || cancelled) return;
       setPois(renderer.pois);
-      setParking(renderer.parking);
       // Both are resolved once at build, so the same tick that finds the places
       // finds the roads between them. Reading `routes` off the ref at render
       // time instead only ever worked because setting `pois` happened to force
@@ -470,7 +630,14 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
       setPlayer(null);
       return;
     }
-    const timer = window.setInterval(() => setPlayer(rendererRef.current?.localPosition() ?? null), 180);
+    const timer = window.setInterval(() => {
+      const renderer = rendererRef.current;
+      setPlayer(renderer?.localPosition() ?? null);
+      // On the same tick, and only while walking — which is the only time either
+      // map is on screen. A bike moves when somebody rides it, so unlike the
+      // places this cannot be resolved once at build.
+      setRides(renderer?.rides() ?? []);
+    }, 180);
     return () => window.clearInterval(timer);
   }, [walking]);
 
@@ -608,21 +775,51 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
     window.setTimeout(() => setRemindLabel('Nhắc tôi'), 2200);
   }, [forecast, index, recipe]);
 
-  const travel = useCallback(
-    (destination: string | { x: number; z: number }) => {
-      const renderer = rendererRef.current;
-      if (!renderer) return;
-      if (typeof destination === 'string') renderer.travelTo(destination);
-      else renderer.travelToPosition(destination.x, destination.z);
-      const position = renderer.localPosition();
-      trip.relocate(position.x, position.z);
+  const travel = useCallback((destination: string | { x: number; z: number }) => {
+    const renderer = rendererRef.current;
+    if (!renderer) return;
+    if (typeof destination === 'string') renderer.travelTo(destination);
+    else renderer.travelToPosition(destination.x, destination.z);
+    // The room is told by `onPlaced` below rather than from here. The renderer
+    // announces every placement it makes, including the ones this component
+    // never asked for — the walker a rebuilt world creates at a new detail
+    // tier was the one that got missed, and it desynced the room silently.
+  }, []);
+
+  /**
+   * Where the renderer put the player, as against where they walked. Fast travel
+   * is an explicit action to the room, not a stream of impossible walk packets —
+   * `handleMove` would refuse those on speed, and it refuses by returning, so
+   * nobody would be told.
+   */
+  /**
+   * Where the camera looks, read fresh on every frame the compass draws.
+   *
+   * Not `player`, which this component samples every 180 ms for the minimap: a
+   * mouse turn covers 180° in a second, so an arrow drawn off a 180 ms sample
+   * trails the very turn it exists to guide by a third of a turn. And not
+   * `player.yaw` either, which is the body's heading — eased toward the
+   * direction of travel, so on a strafe it is ninety degrees off where the
+   * player is actually looking.
+   */
+  const viewpoint = useCallback(() => rendererRef.current?.localView() ?? null, []);
+
+  const onPlaced = useCallback(
+    (x: number, z: number) => {
+      trip.relocate(x, z);
     },
     [trip.relocate]
   );
 
   const onLocalMove = useCallback(
     (move: LocalMove) => {
-      if (trip.status === 'joined') trip.move(move.x, move.z, move.yaw);
+      if (trip.status === 'joined') {
+        trip.move(move.x, move.z, move.yaw, {
+          heading: move.heading,
+          speed: move.speed,
+          riding: move.riding,
+        });
+      }
     },
     [trip]
   );
@@ -653,10 +850,12 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
         remotePlayers={trip.players}
         joystick={joystick}
         onLocalMove={onLocalMove}
+        onPlaced={onPlaced}
         rendererRef={rendererRef}
         style={settings.style}
         tier={settings.tier}
         sensitivity={settings.sensitivity}
+        comfort={comfort}
         onLockChange={onLockChange}
       />
 
@@ -739,7 +938,7 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
                 <Minimap
                   relief={relief}
                   pois={pois}
-                  parking={parking}
+                  rides={rides}
                   discovered={exploration.discovered}
                   player={player}
                   others={trip.players}
@@ -808,7 +1007,7 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
                   playing={playing}
                   onTogglePlay={togglePlay}
                   secondsPerHour={secondsPerHour}
-                  onCycleSpeed={() => setSpeedStep((step) => (step + 1) % SPEEDS.length)}
+                  onCycleSpeed={cycleSpeed}
                   onPlaySunrise={playSunrise}
                   onShare={share}
                   shareLabel={shareLabel}
@@ -822,7 +1021,7 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
               {forecast && (
                 <WeatherPicker
                   value={preset}
-                  onChange={setPreset}
+                  onChange={choosePreset}
                   recipe={recipe}
                   sun={{ night, daylight: sky?.daylight ?? 0 }}
                   realLabel={realLabel}
@@ -867,6 +1066,21 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
             collapsed HUD: what it offers is the thing you are standing in. */}
         {walking && !menuOpen && <ActionPrompt action={prompt} onInteract={() => rendererRef.current?.interact()} />}
 
+        {/* Which way your friends are. The room will happily report "Bạn và 1
+            người nữa" while the person is standing behind you and therefore
+            nowhere on screen at all — measured, two travellers spawn 9 to 17 m
+            apart facing a direction neither of them chose, and that turned out
+            to be the whole of the "multiplayer doesn't work" report. */}
+        {walking && !menuOpen && trip.players.length > 0 && (
+          <CompanionCompass players={trip.players} view={viewpoint} />
+        )}
+
+        {/* The dash. A getter rather than a value, and read on its own animation
+            frame: the speed changes sixty times a second and putting that in
+            React state would re-render this whole subtree with it. It draws
+            nothing on foot, so it can stay mounted. */}
+        {walking && !menuOpen && <RideDash telemetry={() => rendererRef.current?.telemetry() ?? null} />}
+
         <div className="flex w-full items-end justify-between gap-3">
           {hudVisible ? <ControlHints walking={walking} /> : <span />}
           {/* The joystick is how a phone moves at all, so it outlives the menu. */}
@@ -885,8 +1099,8 @@ export const LocationScene = ({ recipe }: { recipe: LocationRecipe }) => {
         player={player}
         others={trip.players}
         routes={routes}
-        parking={parking}
-        onTravelToParking={(x, z) => travel({ x, z })}
+        rides={rides}
+        onTravelTo={(x, z) => travel({ x, z })}
         onTravel={travel}
         canTravel={walking}
       />

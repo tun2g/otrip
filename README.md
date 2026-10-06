@@ -16,10 +16,14 @@ Bốn điểm đến, toạ độ thật, thời tiết thật:
 
 ```bash
 pnpm install
-pnpm dev:web      # http://localhost:3000
+pnpm dev          # web ở http://localhost:3000, phòng đi chung ở cổng 2567
 ```
 
 Yêu cầu Node 24 (`.nvmrc`) và pnpm 10.
+
+`pnpm dev:web` chỉ bật web. Khi đó **Đi cùng bạn sẽ không vào được phòng**: không đặt
+`NEXT_PUBLIC_REALTIME_URL` thì client tìm phòng ở `ws://localhost:2567`, và chỗ đó
+không có ai nghe.
 
 | Lệnh               | Việc                             |
 | ------------------ | -------------------------------- |
@@ -126,8 +130,18 @@ Phòng đi chung lưu trong RAM, khởi động lại server sẽ ngắt các ph
 vị trí lúc vào phòng, chuyển động hai chiều, chat, đi nhanh, người vào sau và rời phòng
 ở cả bốn địa điểm. Kiểm tra trực quan trên VPS bằng hai cửa sổ vào cùng link mời.
 
-Phòng hiện đồng bộ vị trí/hướng nhân vật, đi nhanh và chat. Giờ mô phỏng, lựa chọn
-thời tiết, NPC và trạng thái xe/thuyền vẫn chạy riêng trên từng máy.
+Phòng đồng bộ vị trí/hướng nhân vật, xe đang cưỡi và tốc độ, đi nhanh, chat, **giờ
+mô phỏng, thời tiết chọn tay và cả cái đồng hồ đang chạy** — giờ được _suy ra_ từ một
+mốc thời gian của máy chủ chứ không phải mỗi máy tự đếm, nên hai người không lệch nhau
+cả một giờ tuỳ lúc ai mở trang trước.
+
+NPC, thuyền, dân làng và thú vẫn chạy riêng trên từng máy: tất cả đều sinh từ
+`recipe.seed` rồi tích phân theo delta của chính máy đó, nên muốn khớp thì phải hoặc
+đồng bộ hàng trăm phép biến đổi mười lần một giây, hoặc viết lại mọi module cho độc lập
+khung hình. Chúng là phông cảnh; giờ và thời tiết mới là _nơi này_.
+
+Mã phòng nằm trong URL dưới dạng `?r=`, nên tải lại trang không mất phòng và cái link
+trên thanh địa chỉ chính là lời mời.
 
 Bản đồ lớn có danh sách **Xe máy & thuyền**: chọn điểm để phóng tới vị trí,
 xem khoảng cách và hướng dẫn tương tác. Điểm xe lấy từ cùng danh sách bãi đỗ

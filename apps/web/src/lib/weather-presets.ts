@@ -306,6 +306,17 @@ export const WEATHER_PRESETS: readonly WeatherPreset[] = [
 
 export const DEFAULT_WEATHER_PRESET = REAL.id;
 
+/**
+ * Whether a string names a preset this build has.
+ *
+ * The room carries the choice as a bare string — `trip.room.ts` bounds it by
+ * shape and length and deliberately not against this list, because the table is
+ * a browser file the server has never seen and a new preset should not need a
+ * server deploy. So the check happens here, where the table is.
+ */
+export const isPresetId = (value: unknown): value is WeatherPresetId =>
+  typeof value === 'string' && WEATHER_PRESETS.some((preset) => preset.id === value);
+
 export const weatherPreset = (id: WeatherPresetId): WeatherPreset =>
   WEATHER_PRESETS.find((preset) => preset.id === id) ?? REAL;
 

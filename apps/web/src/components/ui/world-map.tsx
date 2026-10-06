@@ -3,6 +3,8 @@
 import { createPrng, createTerrain, type LocationRecipe, type Terrain } from '@otrip/world';
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 
+import { paintCompanion, wordsForRide, type MapRide } from '@/components/ui/map-symbols';
+import { RideGlyph } from '@/components/ui/ride-glyph';
 import { cn } from '@/lib/utils';
 import { alwaysOnMap } from '@/scene/points-of-interest';
 import type { ResolvedPoi } from '@/scene/points-of-interest';
@@ -530,23 +532,25 @@ export const drawHeadingMarker = (
   context.restore();
 };
 
-type MapPoint = Omit<ResolvedPoi, 'kind'> & { kind: ResolvedPoi['kind'] | 'parking' };
-
-const KIND_LABEL: Record<MapPoint['kind'], string> = {
+const KIND_LABEL: Record<ResolvedPoi['kind'], string> = {
   summit: 'Đỉnh núi',
   valley: 'Sống núi',
   shore: 'Bến thuyền',
-  parking: 'Điểm lấy xe máy',
   island: 'Đảo',
   town: 'Phố',
   grove: 'Rừng cây',
 };
 
-const KIND_GLYPH: Record<MapPoint['kind'], string> = {
+/**
+ * These stay letter-free pictures beside a printed name, which is what makes
+ * them work at 20 px. There was a seventh, `parking: 'P'`, for a synthetic point
+ * per kerb slot; the rides it stood in for now have their own symbols in
+ * `map-symbols.ts`, drawn to survive the corner map's 9 px.
+ */
+const KIND_GLYPH: Record<ResolvedPoi['kind'], string> = {
   summit: '▲',
   valley: '⌃',
   shore: '⚓',
-  parking: 'P',
   island: '◍',
   town: '▣',
   grove: '♣',
@@ -574,14 +578,15 @@ const ROUTE_STYLE: Record<
 
 const SCALE_CHOICES = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000];
 const MAX_ZOOM = 16;
-const NO_PARKING: readonly { x: number; y: number; z: number }[] = [];
+const NO_RIDES: readonly MapRide[] = [];
 const NO_PEOPLE: MapPerson[] = [];
 
-const formatDistance = (metres: number) =>
+/** Exported so the corner map's legend says a distance the same way this one does. */
+export const formatDistance = (metres: number) =>
   metres >= 1000 ? `${(metres / 1000).toFixed(metres % 1000 === 0 ? 0 : 1)} km` : `${Math.round(metres)} m`;
 
 /** Undiscovered places are a question mark, not a pin, so the offset has to be stable between opens. */
-const approximate = (poi: MapPoint, seed: string, terrainSize: number) => {
+const approximate = (poi: ResolvedPoi, seed: string, terrainSize: number) => {
   const random = createPrng(`${seed}:map:${poi.id}`);
   const angle = random() * Math.PI * 2;
   const radius = terrainSize * (0.025 + random() * 0.035);
@@ -595,8 +600,10 @@ type WorldMapProps = {
   recipe: LocationRecipe;
   relief: Relief | null;
   pois: ResolvedPoi[];
-  parking?: readonly { x: number; y: number; z: number }[];
-  onTravelToParking?: (x: number, z: number) => void;
+  /** Live motorbikes and boats, not the kerb they stand on — see `MapRide`. */
+  rides?: readonly MapRide[];
+  /** Walks to a position rather than to a named place, which is what a ride is. */
+  onTravelTo?: (x: number, z: number) => void;
   discovered: Set<string>;
   player: MapPlayer | null;
   others?: MapPerson[];
@@ -617,9 +624,9 @@ export const WorldMap = ({
   onClose,
   recipe,
   relief,
-  pois: landmarks,
-  parking = NO_PARKING,
-  onTravelToParking,
+  pois,
+  rides = NO_RIDES,
+  onTravelTo,
   discovered,
   player,
   others = NO_PEOPLE,
@@ -627,20 +634,6 @@ export const WorldMap = ({
   onTravel,
   canTravel = true,
 }: WorldMapProps) => {
-  const pois = useMemo<MapPoint[]>(
-    () => [
-      ...landmarks,
-      ...parking.map((spot, index) => ({
-        ...spot,
-        id: `parking-${index}`,
-        kind: 'parking' as const,
-        name: parking.length === 1 ? 'Điểm lấy xe máy' : `Điểm lấy xe máy ${index + 1}`,
-        note: 'Xe máy đỗ bên đường trong thế giới 3D. Đi sát xe rồi nhấn E, hoặc chạm nút tương tác, để lên xe. Không có bước thanh toán.',
-      })),
-    ],
-    [landmarks, parking]
-  );
-  const transport = pois.filter((poi) => poi.kind === 'parking' || poi.kind === 'shore');
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const frameRef = useRef<HTMLDivElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -812,23 +805,22 @@ export const WorldMap = ({
 
     context.setTransform(ratio, 0, 0, ratio, 0, 0);
 
+    // The same upright capsule the corner map draws, in the same per-person
+    // colour their body, their ring and their compass arrow carry. This was one
+    // pale `#cdd9e6` disc for everybody, which is the full map disagreeing with
+    // every other drawing of the same person in the app — and a disc is what a
+    // place is, which is the collision the corner map had no room to survive.
     for (const person of others) {
       const point = project(person.x, person.z);
-      context.beginPath();
-      context.arc(point.x, point.y, 4.5, 0, Math.PI * 2);
-      context.fillStyle = '#cdd9e6';
-      context.fill();
-      context.lineWidth = 1.5;
-      context.strokeStyle = 'rgba(11,16,32,0.85)';
-      context.stroke();
+      paintCompanion(context, point.x, point.y, person.id, 1.6);
 
       context.font = '600 11px system-ui, sans-serif';
       context.textAlign = 'center';
       context.lineWidth = 3;
       context.strokeStyle = 'rgba(11,16,32,0.8)';
-      context.strokeText(person.name, point.x, point.y - 9);
+      context.strokeText(person.name, point.x, point.y - 11);
       context.fillStyle = '#e8eef5';
-      context.fillText(person.name, point.x, point.y - 9);
+      context.fillText(person.name, point.x, point.y - 11);
     }
 
     if (player) {
@@ -1029,7 +1021,53 @@ export const WorldMap = ({
     if (pointers.current.size < 2) pinch.current = null;
   };
 
-  const chosen = pois.find((poi) => poi.id === selected) ?? null;
+  /**
+   * Every ride anybody can get to, nearest first.
+   *
+   * No merging here, unlike the corner map: this one zooms to sixteen times the
+   * fit, so two bikes four metres apart are one mark at full extent and two the
+   * moment you lean in, and collapsing them would throw away the second machine
+   * that the spare in area 0 exists to provide.
+   */
+  const reachable = useMemo(() => {
+    const here = rides.filter((ride) => ride.atRest || ride.taken);
+    if (!player) return here;
+    const away = (ride: MapRide) => Math.hypot(ride.x - player.x, ride.z - player.z);
+    return here.sort((a, b) => away(a) - away(b));
+  }, [rides, player]);
+
+  /**
+   * What the card is about, from whichever list the selection came from. A place
+   * has a name of its own and a ride has a state instead, which is the thing
+   * worth reading: a machine you can take, or the one under you.
+   */
+  const chosen = useMemo(() => {
+    const poi = pois.find((entry) => entry.id === selected);
+    if (poi)
+      return {
+        label: KIND_LABEL[poi.kind],
+        name: poi.name,
+        note: poi.note,
+        x: poi.x,
+        z: poi.z,
+        travel: () => onTravel(poi.id),
+      };
+
+    const ride = reachable.find((entry) => entry.id === selected);
+    if (!ride) return null;
+
+    const words = wordsForRide(ride.noun);
+    return {
+      label: words.title,
+      name: ride.taken ? 'Bạn đang lái' : 'Còn trống',
+      note: words.note,
+      x: ride.x,
+      z: ride.z,
+      // Nothing to walk to when you are already sitting on it.
+      travel: ride.taken || !onTravelTo ? null : () => onTravelTo(ride.x, ride.z),
+    };
+  }, [onTravel, onTravelTo, pois, reachable, selected]);
+
   const scaleMetres =
     SCALE_CHOICES.find((candidate) => candidate * scale > 72) ?? SCALE_CHOICES[SCALE_CHOICES.length - 1];
   const kinds = useMemo(() => Array.from(new Set((routes ?? []).map((route) => route.kind))), [routes]);
@@ -1119,26 +1157,30 @@ export const WorldMap = ({
           open
           className="absolute top-3 left-3 z-10 max-w-[min(20rem,calc(100%-5rem))] rounded-panel border border-border bg-panel/95 p-3 shadow-panel"
         >
+          {/* The heading always said "Xe máy & thuyền" and the list under it held
+              neither: it was the kerb slots, twenty of them for six bikes, plus
+              the jetty, which is a place and not a boat. */}
           <summary className="cursor-pointer text-sm font-medium text-accent">
-            Xe máy &amp; thuyền · {transport.length} điểm
+            Xe máy &amp; thuyền · {reachable.filter((ride) => !ride.taken).length} chiếc
           </summary>
           <div className="mt-2 flex max-h-32 flex-col gap-1 overflow-y-auto">
-            {transport.length === 0 && <p className="text-xs text-subtle">Chưa có điểm xe hoặc bến thuyền tại đây.</p>}
-            {transport.map((point) => (
+            {reachable.length === 0 && <p className="text-xs text-subtle">Chưa có xe hay thuyền nào đang đỗ ở đây.</p>}
+            {reachable.map((ride) => (
               <button
-                key={point.id}
+                key={ride.id}
                 type="button"
                 onClick={() => {
-                  setSelected(point.id);
-                  setView(clampView({ x: point.x, z: point.z, scale: fitScale * 8 }));
+                  setSelected(ride.id);
+                  setView(clampView({ x: ride.x, z: ride.z, scale: fitScale * 8 }));
                 }}
-                className="min-h-11 rounded-control border border-border px-3 py-2 text-left text-xs hover:border-accent"
+                className="flex min-h-11 items-center gap-2 rounded-control border border-border px-3 py-2 text-left text-xs hover:border-accent"
               >
-                <span aria-hidden="true">{KIND_GLYPH[point.kind]} </span>
-                {point.name}
-                {player && (
-                  <span className="ml-2 text-subtle">
-                    {formatDistance(Math.hypot(point.x - player.x, point.z - player.z))}
+                <RideGlyph noun={ride.noun} taken={ride.taken} className="size-3 shrink-0" />
+                {wordsForRide(ride.noun).title}
+                {ride.taken && <span className="text-subtle">bạn đang lái</span>}
+                {player && !ride.taken && (
+                  <span className="ml-auto text-subtle">
+                    {formatDistance(Math.hypot(ride.x - player.x, ride.z - player.z))}
                   </span>
                 )}
               </button>
@@ -1148,7 +1190,7 @@ export const WorldMap = ({
 
         {relief &&
           pois.map((poi) => {
-            const found = poi.kind === 'parking' || discovered.has(poi.id) || alwaysOnMap(poi);
+            const found = discovered.has(poi.id) || alwaysOnMap(poi);
             const spot = found ? { x: poi.x, z: poi.z, radius: 0 } : approximate(poi, recipe.seed, terrainSize);
             const point = project(spot.x, spot.z);
             if (point.x < -60 || point.y < -60 || point.x > frame.width + 60 || point.y > frame.height + 60)
@@ -1205,6 +1247,42 @@ export const WorldMap = ({
             );
           })}
 
+        {/* No printed name on a ride, where every place has one. Six markers each
+            captioned "Xe máy" is six captions saying what the shape already says,
+            and the shape is the thing that has to be learned, because it is all
+            the corner map has room for. The legend names it; so does the list and
+            so does `aria-label`. */}
+        {relief &&
+          reachable.map((ride) => {
+            const point = project(ride.x, ride.z);
+            if (point.x < -60 || point.y < -60 || point.x > frame.width + 60 || point.y > frame.height + 60)
+              return null;
+
+            const words = wordsForRide(ride.noun);
+            return (
+              <button
+                key={ride.id}
+                type="button"
+                style={{ left: point.x, top: point.y }}
+                onClick={() => setSelected(ride.id)}
+                aria-label={ride.taken ? `${words.title} — bạn đang lái` : `${words.title} — còn trống`}
+                className={cn(
+                  'absolute grid size-11 -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full outline-none',
+                  'focus-visible:ring-2 focus-visible:ring-accent'
+                )}
+              >
+                <RideGlyph
+                  noun={ride.noun}
+                  taken={ride.taken}
+                  className={cn(
+                    'size-4 drop-shadow-[0_1px_2px_rgba(11,16,32,0.9)] transition-transform',
+                    selected === ride.id ? 'scale-150' : 'hover:scale-125'
+                  )}
+                />
+              </button>
+            );
+          })}
+
         <div
           aria-hidden="true"
           className="pointer-events-none absolute top-3 right-3 grid size-11 place-items-center rounded-full border border-border bg-background/70"
@@ -1254,6 +1332,28 @@ export const WorldMap = ({
                   Mặt nước
                 </p>
               )}
+              {/* The two rides first: they are what somebody opens this panel
+                  for, and they are the symbols the corner map has to teach. */}
+              {Array.from(new Set(rides.map((ride) => ride.noun))).map((noun) => (
+                <p key={noun} className="flex items-center gap-2 text-muted-foreground">
+                  <RideGlyph noun={noun} className="size-2.5 shrink-0" />
+                  {wordsForRide(noun).title}
+                </p>
+              ))}
+              {rides.some((ride) => ride.taken) && (
+                <p className="flex items-center gap-2 text-muted-foreground">
+                  <RideGlyph noun={rides.find((ride) => ride.taken)?.noun ?? ''} taken className="size-2.5 shrink-0" />
+                  Chiếc bạn đang lái
+                </p>
+              )}
+              {others.length > 0 && (
+                <p className="flex items-center gap-2 text-muted-foreground">
+                  {/* A rounded pill is the capsule both maps paint, so the row
+                      names the shape rather than approximating it. */}
+                  <span aria-hidden="true" className="inline-block h-3 w-1.5 shrink-0 rounded-full bg-haze" />
+                  Người đi cùng
+                </p>
+              )}
               <p className="flex items-center gap-2 text-muted-foreground">
                 <span aria-hidden="true" className="inline-block size-2 rounded-full bg-accent" />
                 Đã khám phá
@@ -1285,33 +1385,31 @@ export const WorldMap = ({
 
         {chosen && (
           <section className="pointer-events-auto absolute bottom-3 left-1/2 w-[min(22rem,calc(100%-1.5rem))] -translate-x-1/2 rounded-panel border border-border bg-panel/90 p-3 shadow-panel backdrop-blur-md">
-            <p className="text-[0.65rem] tracking-wide text-accent uppercase">{KIND_LABEL[chosen.kind]}</p>
+            <p className="text-[0.65rem] tracking-wide text-accent uppercase">{chosen.label}</p>
             <p className="font-display text-base">{chosen.name}</p>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{chosen.note}</p>
-            {chosen.kind === 'shore' && (
-              <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-                Đi xuống cầu bến, tới sát thuyền rồi nhấn E hoặc chạm nút tương tác để lên thuyền.
-              </p>
-            )}
             {player && (
               <p className="mt-1 text-[0.7rem] text-subtle">
                 cách bạn {formatDistance(Math.hypot(chosen.x - player.x, chosen.z - player.z))}
               </p>
             )}
             <div className="mt-2 flex gap-2">
-              <button
-                type="button"
-                disabled={!canTravel || (chosen.kind === 'parking' && !onTravelToParking)}
-                title={canTravel ? undefined : 'Bật “Đi bộ” để tới đây'}
-                onClick={() => {
-                  if (chosen.kind === 'parking') onTravelToParking?.(chosen.x, chosen.z);
-                  else onTravel(chosen.id);
-                  onClose();
-                }}
-                className="h-11 rounded-control border border-accent/60 px-3 text-xs text-accent transition-colors hover:border-accent disabled:opacity-50"
-              >
-                Đi tới đây
-              </button>
+              {/* Absent rather than disabled for the ride under you: a dead
+                  button invites the press that the title has to then explain. */}
+              {chosen.travel && (
+                <button
+                  type="button"
+                  disabled={!canTravel}
+                  title={canTravel ? undefined : 'Bật “Đi bộ” để tới đây'}
+                  onClick={() => {
+                    chosen.travel?.();
+                    onClose();
+                  }}
+                  className="h-11 rounded-control border border-accent/60 px-3 text-xs text-accent transition-colors hover:border-accent disabled:opacity-50"
+                >
+                  Đi tới đây
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => setSelected(null)}
