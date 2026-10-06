@@ -58,9 +58,18 @@ const BAND_SCAN = 220;
 
 /**
  * A shoreline is a contour, not an area. Rejection sampling the whole map for it
- * throws away ninety-nine samples in a hundred — the waterline band is 0.3% of
- * Tràng An and 1.4% of Hồ Tây, and asking `scatterOnTerrain` for 6300 reeds cost
- * half a second and still returned a third of them. One pass over the heightfield
+ * throws away ninety-nine samples in a hundred — the waterline band was 1.4% of
+ * Hồ Tây, and asking `scatterOnTerrain` for 6300 reeds cost half a second and
+ * still returned a third of them.
+ *
+ * Hồ Tây's band is **0.8%** since the lake stopped being a channel across the
+ * patch and became a basin in it: a round lake has less shoreline than a river
+ * running the full 4.2 km, which makes the argument for scanning rather than
+ * sampling stronger, not weaker. (The reading of 0.3% for Tràng An that stood
+ * here with it does not reproduce — the same scan under the reed kind's own
+ * filter answers 27%, which is what a floodplain of flooded low lobes should
+ * answer. It is left out rather than corrected: nothing about Tràng An's terrain
+ * was touched in the change that moved these numbers, so it needs its own look.) One pass over the heightfield
  * finds every cell on the band instead, and the plants then grow in beds around
  * those cells, which is also how reeds actually grow.
  */

@@ -70,6 +70,48 @@ export type RiverParams = {
   alongX: boolean;
 };
 
+/**
+ * A closed body of water: a hollow pressed into the heightfield that stops short
+ * of the patch border, so the land goes round it.
+ *
+ * `river` cannot be one. Its channel is `|across - centre| < width` with the
+ * centre a sine of the along-axis, which has no ending — it crosses the patch
+ * whatever the amplitude, and Hồ Tây was built with one. Measured on the shipped
+ * recipe (`amplitude: 0, width: 990` over a 4200 m patch): the water ran edge to
+ * edge and the map was two landmasses, 5.54 km² of west bank carrying 73 of 105
+ * houses against 5.11 km² of east carrying the other 32, with 1325 m of water
+ * between them at the narrowest row — against a `BRIDGE_LIMIT` of 440 m in
+ * `road-network`. A third of the town was on an island nobody could reach, which
+ * is what a player saw when they opened the world map and asked why the other
+ * half was chán. The real Hồ Tây is a lake in the middle of Hanoi with city on
+ * every side of it, so a basin is not a liberty taken with the place; a channel
+ * was.
+ *
+ * Nothing says "lake" in the type on purpose — it is a hollow, and whether water
+ * stands in it is decided by `WaterParams.level` the same way a carved channel
+ * becomes a river for free.
+ */
+export type BasinParams = {
+  /** Centre of the hollow, in metres from the middle of the patch. */
+  x: number;
+  z: number;
+  /** Mean radius of the rim — where the hollow stops, not the waterline. */
+  radius: number;
+  /** Metres the floor is cut below the ground that would otherwise be there. */
+  depth: number;
+  /**
+   * Metres of shelving between the rim and the full cut. The waterline lands
+   * somewhere inside this band rather than on the rim, and because the ground it
+   * is cut from already varies with the massif, that is what makes the shore
+   * wander instead of being a drawn circle.
+   */
+  shore: number;
+  /** How far the rim wanders, as a fraction of `radius`. 0 is a dinner plate. */
+  wobble: number;
+  /** Ellipse: above 1 stretches the hollow along X. Hồ Tây is wider than it is tall. */
+  stretch: number;
+};
+
 export type TerrainParams = {
   profile: TerrainProfile;
   /** Width and depth of the generated patch, in metres. */
@@ -97,6 +139,7 @@ export type TerrainParams = {
   /** Floor added before shaping, so a delta is not a valley with no ground. */
   baseHeight: number;
   river: RiverParams | null;
+  basin: BasinParams | null;
 };
 
 /**

@@ -2,6 +2,7 @@ export { createPrng, hashSeed, type Prng } from './prng.ts';
 export { createNoise, createNoise4, fbm2d, ridged2d, tileableFbm, type FbmOptions } from './noise.ts';
 export {
   type AloftKind,
+  type BasinParams,
   type CloudSeaParams,
   type FarmingKind,
   type LocationRecipe,

@@ -31,12 +31,14 @@ export const createTerrain = (recipe: LocationRecipe, segmentsOverride?: number)
     profile,
     baseHeight,
     river,
+    basin,
   } = recipe.terrain;
   const segments = segmentsOverride ?? recipe.terrain.segments;
 
   const ridgeNoise = createNoise(`${recipe.seed}:ridge`);
   const detailNoise = createNoise(`${recipe.seed}:detail`);
   const massifNoise = createNoise(`${recipe.seed}:massif`);
+  const basinNoise = createNoise(`${recipe.seed}:basin`);
 
   const side = segments + 1;
   const heights = new Float32Array(side * side);
@@ -119,6 +121,32 @@ export const createTerrain = (recipe: LocationRecipe, segmentsOverride?: number)
         const fromCentre = Math.abs(across - centre);
         if (fromCentre < river.width) {
           height -= river.depth * smoothstep(0, 1, 1 - fromCentre / river.width);
+        }
+      }
+
+      if (basin) {
+        // Elliptical distance, so the hollow can be wider than it is tall the
+        // way Hồ Tây is — 3.2 km east to west against 2.4 north to south.
+        const fromX = (x - basin.x) / basin.stretch;
+        const fromZ = z - basin.z;
+        const reach = Math.hypot(fromX, fromZ);
+        // The rim's wander is sampled on a circle rather than on the plane, so
+        // it is a function of bearing alone and meets itself at the seam. A
+        // plane sample would leave a step where the angle wraps.
+        const bearing = Math.atan2(fromZ, fromX);
+        const wander = fbm2d(basinNoise, Math.cos(bearing) * 3, Math.sin(bearing) * 3, {
+          octaves: 3,
+          frequency: 1,
+          lacunarity: 2,
+          gain: 0.5,
+        });
+        const rimReach = basin.radius * (1 + basin.wobble * wander);
+        if (reach < rimReach) {
+          // Nothing at the rim, the full cut `shore` metres inside it. The
+          // waterline is wherever that shelf crosses `water.level`, which moves
+          // with the massif underneath — that is the shoreline's irregularity,
+          // and it is why this is a shelf rather than a step.
+          height -= basin.depth * smoothstep(rimReach, Math.max(0, rimReach - basin.shore), reach);
         }
       }
 

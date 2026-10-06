@@ -27,6 +27,7 @@ export const TA_XUA: LocationRecipe = {
     edgeFalloff: 0.76,
     baseHeight: 0,
     river: null,
+    basin: null,
   },
   cloudSea: { altitude: 280, thickness: 140, layers: 5 },
   water: null,
@@ -137,6 +138,7 @@ export const HOI_AN: LocationRecipe = {
     edgeFalloff: 0.84,
     baseHeight: 36,
     river: { amplitude: 420, waves: 1.3, width: 330, depth: 58, alongX: true },
+    basin: null,
   },
   cloudSea: null,
   water: { level: 28, deep: '#2f4d55', shallow: '#5f8e87', ripple: 0.35 },
@@ -248,6 +250,7 @@ export const TRANG_AN: LocationRecipe = {
     edgeFalloff: 0.88,
     baseHeight: 18,
     river: null,
+    basin: null,
   },
   cloudSea: null,
   water: { level: 13.5, deep: '#1f5b58', shallow: '#56a99b', ripple: 0.16 },
@@ -310,8 +313,27 @@ export const TRANG_AN: LocationRecipe = {
 };
 
 /**
- * Hồ Tây — the lake is most of the map, with the city standing back from it.
- * Weather is Hà Nội's, which is the lake's weather.
+ * Hồ Tây — the lake is the middle of the map, with the city all the way round
+ * it. Weather is Hà Nội's, which is the lake's weather.
+ *
+ * It was drawn as a `river` until a player opened the world map and asked why
+ * the other half was chán. `river` has no ending — its channel is a band either
+ * side of a sine, so it crosses the patch whatever the numbers — and at
+ * `amplitude: 0, width: 990` over 4200 m it ran edge to edge and cut the map in
+ * two. Measured on that recipe: 5.54 km² of west bank carrying 73 of 105 houses
+ * against 5.11 km² of east carrying the other 32, 1325 m of water between them
+ * at the narrowest row against a `BRIDGE_LIMIT` of 440 m, and **52%** of the
+ * walkable land reachable on foot from the spawn. A third of the town was on an
+ * island, and no road, landmark or parking row had ever been planned there,
+ * because none could be.
+ *
+ * On the `basin` it is one piece of ground: 12.25 km² walkable, 100% of it
+ * reachable on foot, with the water 5.29 km² — against the real lake's 5.0 km²,
+ * which is the one dimension here that did not have to be compressed. The ring
+ * of dry land is 700 m wide at its narrowest, east and west, and 1.8 km at the
+ * corners, so there is room for the city and for the road to go round. The
+ * radius is a little under the real 3.2 km by 2.4 km because the patch has to
+ * hold Tây Hồ as well as the lake.
  */
 export const HO_TAY: LocationRecipe = {
   slug: 'ho-tay',
@@ -333,7 +355,8 @@ export const HO_TAY: LocationRecipe = {
     smoothing: 3,
     edgeFalloff: 0.92,
     baseHeight: 42,
-    river: { amplitude: 0, waves: 1, width: 990, depth: 50, alongX: false },
+    river: null,
+    basin: { x: 0, z: 0, radius: 1080, depth: 34, shore: 300, wobble: 0.13, stretch: 1.28 },
   },
   cloudSea: null,
   water: { level: 28, deep: '#2b3f52', shallow: '#6d8a9c', ripple: 0.3 },
@@ -353,9 +376,17 @@ export const HO_TAY: LocationRecipe = {
   // cầu Long Biên; they do not pass between the lake and the river. The track is
   // about 2.7 km south-east of the lake centre against a patch half-extent of
   // 2.1 km, so it grazes this map rather than crossing it. Kept because a metre
-  // gauge line really is that close and the measured alignment puts it on the
-  // river side, where it is drawn; no platform, because the nearest stops are
+  // gauge line really is that close; no platform, because the nearest stops are
   // Long Biên and Gia Lâm.
+  //
+  // "Where the measured alignment puts it" used to say "the river side", which
+  // stopped meaning anything when the river became a basin. `railway.ts` surveys
+  // its own alignment against the terrain, and on the lake it crosses a corner of
+  // the water on truss: measured 440 m of deck over water and 13 of 82 formation
+  // obstacles, against 830 m and 24 of 88 on the old channel. So the line clips
+  // the lake less than it clipped the river, and the town-service discount in
+  // `railway.ts` — written because a flat bonus once bought this line a
+  // kilometre and a half of truss straight across the water — is still holding.
   railway: { carriages: 5, headway: 260, station: false },
   pois: [
     {

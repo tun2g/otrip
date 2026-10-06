@@ -46,6 +46,17 @@ const OLD_TOWN_ROW: Mix = [
   { type: 'nha-co', weight: 5 },
 ];
 
+/**
+ * The outlying hamlets get a miếu.
+ *
+ * Every style's first plan is the one settlement with something at its centre —
+ * an đình, a chùa, a nhà rông — and every later plan carried `landmark: null`,
+ * so the four to eleven other hamlets each map builds were houses, a granary and
+ * a pen. Walking out to one arrived at buildings rather than at a place. A miếu
+ * is the right size and the right register for a hamlet (see
+ * `building-shrine.ts`), and `PLOT.mieu` is slack enough on slope to stand on a
+ * ridge, which `PLOT.dinh` is not.
+ */
 export const SETTLEMENTS: Record<TownStyle, SettlementPlan[]> = {
   highland: [
     {
@@ -74,7 +85,7 @@ export const SETTLEMENTS: Record<TownStyle, SettlementPlan[]> = {
       gap: 5.5,
       setback: 6.5,
       street: [{ type: 'nha-san', weight: 1 }],
-      landmark: null,
+      landmark: 'mieu',
       extras: [
         { type: 'granary', count: 2 },
         { type: 'pen', count: 1 },
@@ -113,7 +124,7 @@ export const SETTLEMENTS: Record<TownStyle, SettlementPlan[]> = {
         { type: 'nha-ong', weight: 3 },
         { type: 'nha-co', weight: 2 },
       ],
-      landmark: null,
+      landmark: 'mieu',
       extras: [
         { type: 'drying-yard', count: 1 },
         { type: 'pen', count: 1 },
@@ -159,7 +170,7 @@ export const SETTLEMENTS: Record<TownStyle, SettlementPlan[]> = {
         { type: 'nha-ong', weight: 2 },
         { type: 'nha-co', weight: 1 },
       ],
-      landmark: null,
+      landmark: 'mieu',
       extras: [
         { type: 'drying-yard', count: 1 },
         { type: 'granary', count: 1 },
@@ -199,7 +210,7 @@ export const SETTLEMENTS: Record<TownStyle, SettlementPlan[]> = {
         { type: 'nha-ong', weight: 7 },
         { type: 'block', weight: 2 },
       ],
-      landmark: null,
+      landmark: 'mieu',
       extras: [],
       terrace: true,
       bank: 50,

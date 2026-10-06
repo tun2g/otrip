@@ -1,4 +1,7 @@
-import { scatterOnTerrain, type LocationRecipe, type PoiKind, type PoiRecipe, type Terrain } from '@otrip/world';
+import { scatterOnTerrain, type LocationRecipe, type PoiRecipe, type Terrain } from '@otrip/world';
+
+import { findLandmasses } from './landmass';
+import { scorer, standable, type Candidate, type Place } from './poi-rules';
 
 /**
  * Why a place is not where its own rule would have put it. `scatter` means the
@@ -9,9 +12,6 @@ import { scatterOnTerrain, type LocationRecipe, type PoiKind, type PoiRecipe, ty
 export type PoiFallback = 'scatter' | 'standable';
 
 export type ResolvedPoi = PoiRecipe & { x: number; y: number; z: number; fallback?: PoiFallback };
-
-/** Anything that counts as a built thing for the purpose of finding a settlement. */
-type Place = { x: number; z: number };
 
 /** How close you have to get for a place to count as visited. */
 export const DISCOVERY_RADIUS = 70;
@@ -32,8 +32,6 @@ export const alwaysOnMap = (poi: { kind: string }): boolean => poi.kind === 'sho
 const GRID = 56;
 const MIN_SEPARATION = 260;
 
-type Candidate = { x: number; z: number; height: number; slope: number };
-
 const sampleGrid = (terrain: Terrain): Candidate[] => {
   const candidates: Candidate[] = [];
   const half = terrain.size / 2;
@@ -49,108 +47,6 @@ const sampleGrid = (terrain: Terrain): Candidate[] => {
 
   return candidates;
 };
-
-/** Mean height of a ring around a point — the basis for prominence and islands. */
-const ringHeight = (terrain: Terrain, x: number, z: number, radius: number): number => {
-  let total = 0;
-  for (let step = 0; step < 8; step += 1) {
-    const angle = (step / 8) * Math.PI * 2;
-    total += terrain.heightAt(x + Math.cos(angle) * radius, z + Math.sin(angle) * radius);
-  }
-  return total / 8;
-};
-
-const ringUnderwater = (terrain: Terrain, x: number, z: number, radius: number, waterLevel: number): number => {
-  let under = 0;
-  for (let step = 0; step < 12; step += 1) {
-    const angle = (step / 12) * Math.PI * 2;
-    if (terrain.heightAt(x + Math.cos(angle) * radius, z + Math.sin(angle) * radius) < waterLevel) under += 1;
-  }
-  return under / 12;
-};
-
-/**
- * How far apart the built things are, so a settlement can be found among ninety
- * houses scattered over three kilometres as well as among seventy packed into
- * one street. Floored at the width of a village centre.
- */
-const clusterRadius = (places: readonly Place[], size: number): number =>
-  Math.max(140, Math.sqrt((size * size) / Math.max(1, places.length)) * 0.8);
-
-const scorer = (
-  kind: PoiKind,
-  terrain: Terrain,
-  waterLevel: number,
-  places: readonly Place[]
-): ((candidate: Candidate) => number) => {
-  const half = terrain.size / 2;
-  const nearestPlace = (x: number, z: number) =>
-    places.length === 0 ? Infinity : Math.min(...places.map((place) => Math.hypot(x - place.x, z - place.z)));
-
-  switch (kind) {
-    case 'summit':
-      return (c) => (c.height < waterLevel ? -Infinity : c.height);
-
-    case 'valley':
-      // A narrow spine: high, with the ground falling away on both sides.
-      return (c) =>
-        c.height < waterLevel ? -Infinity : c.height - ringHeight(terrain, c.x, c.z, terrain.size * 0.05) * 1.1;
-
-    case 'shore':
-      // Right at the waterline, and as far from the middle as the map allows.
-      return (c) => {
-        if (!Number.isFinite(waterLevel)) return -Infinity;
-        const depth = Math.abs(c.height - waterLevel);
-        if (depth > 3 || c.height < waterLevel) return -Infinity;
-        return Math.hypot(c.x, c.z) / half - depth;
-      };
-
-    case 'island':
-      return (c) => {
-        if (!Number.isFinite(waterLevel) || c.height <= waterLevel + 1) return -Infinity;
-        const surrounded = ringUnderwater(terrain, c.x, c.z, terrain.size * 0.06, waterLevel);
-        return surrounded < 0.6 ? -Infinity : surrounded * 100 + c.height * 0.05;
-      };
-
-    case 'town': {
-      // Density, not proximity. Scoring by the nearest single building put the
-      // marker next to one outlying house in a field, with the actual town a
-      // kilometre away. A falling kernel rather than a count inside a fixed ring,
-      // because the ring returned zero everywhere for a hamlet whose houses are
-      // three hundred metres apart — and a score of zero everywhere is how
-      // "Bản trên núi" silently stopped existing at Tà Xùa.
-      const spread = clusterRadius(places, terrain.size);
-      return (c) => {
-        if (places.length === 0) return -Infinity;
-        let weight = 0;
-        for (const place of places) {
-          const dx = c.x - place.x;
-          const dz = c.z - place.z;
-          weight += Math.exp(-(dx * dx + dz * dz) / (spread * spread));
-        }
-        return weight;
-      };
-    }
-
-    case 'grove':
-    default:
-      // Away from the houses, out of the water, on ground you can stand on.
-      return (c) => {
-        if (c.height <= waterLevel + 2 || c.slope > 0.4) return -Infinity;
-        return Math.min(nearestPlace(c.x, c.z), 600) - Math.hypot(c.x, c.z) * 0.15;
-      };
-  }
-};
-
-/**
- * Ground you can stand on, and nothing more. The last resort for a place whose
- * own rule found nowhere: better a reachable spot than a name in the panel that
- * counts towards a total nobody can complete.
- */
-const standable =
-  (waterLevel: number): ((candidate: Candidate) => number) =>
-  (c) =>
-    c.height <= waterLevel + 1 || c.slope > 0.5 ? -Infinity : 1 - c.slope;
 
 /**
  * Beside the jetty rather than on it. A marker is a 24 m mast with an 11 m
@@ -186,13 +82,11 @@ export const resolvePois = (
   landing?: { x: number; z: number; heading: number } | null
 ): ResolvedPoi[] => {
   const waterLevel = recipe.water?.level ?? Number.NEGATIVE_INFINITY;
-  const candidates = sampleGrid(terrain);
   const resolved: ResolvedPoi[] = [];
 
   // Two locations have `town: null`, so a recipe there can still name a
   // settlement — Tà Xùa's "Bản trên núi" is one — and the only built things on
-  // the map are the scattered houses. Mirrors the filter in `scatter-meshes.ts`:
-  // the two have to agree or the marker lands where no house stands.
+  // the map are the scattered houses.
   const scattered: Place[] =
     buildings.length > 0
       ? []
@@ -203,6 +97,56 @@ export const resolvePois = (
         });
   const places: readonly Place[] = buildings.length > 0 ? buildings : scattered;
   const fromScatter = buildings.length === 0 && scattered.length > 0;
+
+  /**
+   * Ground joined to the ground the people live on, and no other.
+   *
+   * A landmark on a landmass no road and no walker can reach is a name in the
+   * panel counting towards a total nobody can complete, which is the exact
+   * failure the `standable` fallback below exists to make loud — and Hồ Tây was
+   * two landmasses until its recipe moved onto a `basin`, 5.54 km² of west bank
+   * against 5.11 km² of east with 1325 m of water between them. Applied to every
+   * kind rather than to `island` alone, because the rules that climb and the
+   * rules that go looking for open ground can all walk off the edge of the world
+   * the player is standing in. Hồ Tây no longer has an edge to walk off; Tràng
+   * An has seven landmasses and Hội An two, and a recipe is one parameter away
+   * from having an island again.
+   *
+   * The home side is the one most of the houses are on, not the largest piece:
+   * the landmass that matters is where the village is.
+   */
+  const land = Number.isFinite(waterLevel) ? findLandmasses(terrain, waterLevel) : null;
+  let home = 0;
+  if (land && places.length > 0) {
+    const votes = new Map<number, number>();
+    for (const place of places) {
+      const id = land.at(place.x, place.z);
+      if (id >= 0) votes.set(id, (votes.get(id) ?? 0) + 1);
+    }
+    for (const [id, count] of votes) if (count > (votes.get(home) ?? -1)) home = id;
+  }
+  // A ring as well as the point, because the landmass grid is ~20 m and a POI
+  // grid cell is 65 to 93 m: a candidate that genuinely stands on the bank can
+  // fall in a cell the flood called wet, and refusing it would cost exactly the
+  // shoreline candidates the `island` and `shore` rules are looking for.
+  const onHomeGround = (x: number, z: number): boolean => {
+    if (!land) return true;
+    if (land.at(x, z) === home) return true;
+    const reach = terrain.size / 90;
+    for (let step = 0; step < 8; step += 1) {
+      const angle = (step / 8) * Math.PI * 2;
+      if (land.at(x + Math.cos(angle) * reach, z + Math.sin(angle) * reach) === home) return true;
+    }
+    return false;
+  };
+
+  const candidates = sampleGrid(terrain).filter((candidate) => onHomeGround(candidate.x, candidate.z));
+  let roof: Candidate | null = null;
+  for (const candidate of candidates) {
+    if (candidate.height <= waterLevel) continue;
+    if (!roof || candidate.height > roof.height) roof = candidate;
+  }
+  const ground = { terrain, waterLevel, places, roof, inland: (terrain.size / 2) * recipe.terrain.edgeFalloff };
 
   const pick = (score: (candidate: Candidate) => number): Candidate | null => {
     let best: Candidate | null = null;
@@ -227,8 +171,10 @@ export const resolvePois = (
   for (const poi of recipe.pois) {
     // A shore is a landing, and on each of these maps exactly one landing is
     // built: the jetty. Scored on its own rule — waterline, furthest from the
-    // middle of the map — it went somewhere else entirely: measured 2247 m from
-    // the jetty at Hội An, 3105 m at Tràng An, 2388 m at Hồ Tây. That gap is why
+    // middle of the map — it goes somewhere else entirely: re-measured on the
+    // shipped recipes at 1833 m from the jetty at Hội An, 2466 m at Tràng An and
+    // 1730 m at Hồ Tây, where the first reading of this was 2247 / 3105 / 2388
+    // before the lake became a basin and the hamlets moved the hub. That gap is why
     // walking to "Bến thuyền nan" arrived at bare water with no boat and no
     // jetty in sight; the name and the thing it names were never the same place.
     // Placed directly rather than through `pick`, because the jetty is a built
@@ -239,7 +185,7 @@ export const resolvePois = (
       continue;
     }
 
-    const found = pick(scorer(poi.kind, terrain, waterLevel, places));
+    const found = pick(scorer(poi.kind, ground));
     let fallback: PoiFallback | undefined = found && fromScatter && poi.kind === 'town' ? 'scatter' : undefined;
     let best = found;
 

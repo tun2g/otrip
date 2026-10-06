@@ -1,4 +1,4 @@
-import { createPrng, type LocationRecipe, type Terrain } from '@otrip/world';
+import { createNoise, createPrng, fbm2d, type LocationRecipe, type Terrain } from '@otrip/world';
 import {
   AdditiveBlending,
   BoxGeometry,
@@ -21,6 +21,7 @@ import {
 } from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
+import { findLandmasses } from './landmass';
 import type { ResolvedPoi } from './points-of-interest';
 import { applyWetLook, type WetLookOptions } from './rain';
 import type { Platform } from './walker';
@@ -37,6 +38,66 @@ export type RoadKind = 'main' | 'secondary' | 'lane' | 'trail';
  * the lots are what the renderer has at the point the roads are surveyed.
  */
 export type Standing = { x: number; z: number };
+
+/**
+ * The settlements, as places rather than as houses.
+ *
+ * `planTown` has built several per destination since the day it stopped being
+ * gated on `recipe.town` — measured on the shipped recipes, 7 at Tà Xùa, 4 at
+ * Hội An, 11 at Tràng An and 5 at Hồ Tây — and nothing downstream knew there
+ * was more than one. `findHub` takes the densest, the trunk is routed out from
+ * it and the three cart lanes go to the far edges *of that one*, so every other
+ * hamlet on the map had no road to it, no track to its neighbour and no reason
+ * for anyone to walk out: 20 along the west of the Tà Xùa ridge, and 32 on the
+ * east bank of what was then a channel cutting Hồ Tây in two, built in full and
+ * joined to nothing.
+ *
+ * Single-linked at the separation `points-of-interest` already uses to decide
+ * two things are not the same place, and ordered largest first with the
+ * coordinates breaking ties, because the order decides which hamlet gets the
+ * lane when the budget runs out and it has to be the same order every time.
+ */
+const HAMLET_LINK = 260;
+/** Fewer houses than this is an outlying farm, not somewhere a road goes. */
+const HAMLET_MIN = 3;
+
+type Settlement = { x: number; z: number; count: number };
+
+const settlements = (buildings: readonly Standing[]): Settlement[] => {
+  const owner = new Int32Array(buildings.length).fill(-1);
+  const found: Settlement[] = [];
+  const queue: number[] = [];
+
+  for (let seed = 0; seed < buildings.length; seed += 1) {
+    if (owner[seed] >= 0) continue;
+    const id = found.length;
+    const place = { x: 0, z: 0, count: 0 };
+    owner[seed] = id;
+    queue.length = 0;
+    queue.push(seed);
+
+    while (queue.length > 0) {
+      const at = queue.pop() as number;
+      place.x += buildings[at].x;
+      place.z += buildings[at].z;
+      place.count += 1;
+      for (let other = 0; other < buildings.length; other += 1) {
+        if (owner[other] >= 0) continue;
+        if (Math.hypot(buildings[at].x - buildings[other].x, buildings[at].z - buildings[other].z) > HAMLET_LINK) {
+          continue;
+        }
+        owner[other] = id;
+        queue.push(other);
+      }
+    }
+
+    place.x /= place.count;
+    place.z /= place.count;
+    found.push(place);
+  }
+
+  return found.filter((place) => place.count >= HAMLET_MIN).sort((a, b) => b.count - a.count || a.x - b.x || a.z - b.z);
+};
 
 /**
  * Metres per search cell. The step has to be finer than the feature it is meant
@@ -58,6 +119,52 @@ const BRIDGE_LIMIT = 440;
 const CLIFF_SLOPE = 1.4;
 /** Spacing of the resampled centreline, in metres. */
 const SPACING = 7;
+/**
+ * Feature size of the going field, in metres, and how much of a road's cost it
+ * decides.
+ *
+ * The cost field is what gives a route its shape, and on the delta it had
+ * nothing to say: away from a hill `stepCost` reduces to the run itself, a
+ * search over a uniform field returns the straight line, and the carriageway
+ * came out 96 to 100% straight at Hội An, Tràng An and Hồ Tây — the whole bend
+ * law in `vehicles.ts` was dead code there, every vehicle at cruise everywhere.
+ * This is the term that stands for everything which makes flat ground
+ * non-uniform and is not its shape: the paddy bunds, the graves, the plot that
+ * was already somebody's. At 220 m the channels it opens are the length of a
+ * road's bend rather than of a wobble, and 0.45 is as hard as it can push
+ * before a branch starts failing its own admission test.
+ */
+const GOING_WAVE = 220;
+const GOING_WEIGHT = 0.45;
+/**
+ * Terrain gradient at which the going field stops counting. Above this the land
+ * decides and nothing else gets a vote — which is both true and load-bearing:
+ * Tà Xùa has one corridor a grader could take, and an untempered field priced
+ * it out of `trunkEnds`'s cost gate at seven of the twelve wavelengths tried,
+ * taking the only drivable road on the mountain with it.
+ */
+const GOING_SLOPE = 0.35;
+/**
+ * Design radius per kind, in metres: the tightest bend the easing below will
+ * leave in a carriageway. Set against the slowest-cornering vehicle
+ * `vehicles.ts` admits on each — a xe khách corners at `sqrt(grip / curvature)`
+ * with `grip` 2.9, which holds its 12 m/s cruise down to a 50 m radius, so a
+ * design radius of 70 leaves it margin and the bends that come out tighter than
+ * the design are the ones it has to brake for. A trail is left the hairpins a
+ * path is entitled to.
+ */
+const EASE_RADIUS: Record<RoadKind, number> = { main: 70, secondary: 55, lane: 30, trail: 10 };
+/**
+ * Closest two knots of a carriageway may sit, as a multiple of the cell step.
+ *
+ * The radius cap below looks at one knot at a time, and two opposite deviations
+ * in adjacent knots defeat it: each knot's own circle is comfortable while the
+ * spline between them reverses in 60 m. Measured, that left 9 to 14 m radii on
+ * four of the seven main roads. Thinning first bounds the shortest wavelength
+ * the route can carry, and 2.5 cells took the worst bend on the Hội An trunk
+ * from a 9 m radius to 49 m.
+ */
+const KNOT_APART = 2.5;
 /** Height of a bridge deck above the water surface. */
 const DECK_CLEARANCE = 2.4;
 /**
@@ -78,18 +185,19 @@ const SHOULDER = 0.6;
 const CROSSING_HALF = 2.3;
 /**
  * How far the surveyed head of a branch may be pulled to reach the ribbon it
- * meets, and the knots that pull is spread over.
+ * meets, and the metres of road that pull is spread over.
  *
  * A branch is surveyed from a cell on the trunk's cell path, but the trunk's own
  * ribbon is that path simplified and then eased laterally, so the two parted
  * company: measured across the four destinations the head of a branch finished
  * between 26 and 153 m from the road it branches off — on the ground, a lane
- * that stops in a field short of the highway. One knot is a step the spline
- * overshoots; five is about 150 m of road, which is the length a branch really
- * takes to swing onto a carriageway.
+ * that stops in a field short of the highway. A pull spread over less is a step
+ * the spline overshoots; 150 m is the length a branch really takes to swing onto
+ * a carriageway. Counted in distance rather than in knots because `KNOT_APART`
+ * makes the knot spacing variable.
  */
 const TIE_REACH = 200;
-const TIE_KNOTS = 5;
+const TIE_SPREAD = 150;
 
 /**
  * Each kind sits a little higher than the one before it. Where a branch meets a
@@ -109,6 +217,14 @@ const KIND_ORDER: RoadKind[] = ['main', 'secondary', 'lane', 'trail'];
 
 /** A path longer than this is not one walk, whatever the crest bonus thinks. */
 const MAX_TRAIL_LENGTH = 2200;
+/**
+ * Trails the named places, the crest and the bank may have between them, and the
+ * further tracks the hamlets may add on top. Split rather than one number so
+ * that making room for the paths between the bản cannot hand a sixth path to a
+ * viewpoint: the five is what those callers have always shared.
+ */
+const NAMED_TRAILS = 5;
+const HAMLET_TRAILS = 4;
 
 /** Shorter than this and a route is a scrap of ribbon, not somewhere you go. */
 const MIN_LENGTH: Record<RoadKind, number> = { main: 160, secondary: 130, lane: 100, trail: 110 };
@@ -144,8 +260,16 @@ export type Road = {
   points: Float32Array;
 };
 
-/** Where a motorbike is left standing. Heading points the way the bike faces. */
-export type ParkingSpot = { x: number; y: number; z: number; heading: number };
+/**
+ * Where a motorbike is left standing. Heading points the way the bike faces.
+ *
+ * `area` groups the slots of one row — bikes are left in a line against a kerb,
+ * four or five of them 0.9 m apart, and that whole line is *one place you can go
+ * to find a bike*. Without the grouping a caller spreading itself over the flat
+ * array puts every bike it has within four metres of the others, which is what
+ * left a five-kilometre map with exactly one place to pick one up.
+ */
+export type ParkingSpot = { x: number; y: number; z: number; heading: number; area: number };
 
 export type RoadNetwork = {
   group: Group;
@@ -314,9 +438,11 @@ type Grid = {
   bank: Float32Array;
   /** The largest prominence on the map, so the ridge bonus can be normalised. */
   relief: number;
+  /** -1..1, mean zero: how hard the going is here beyond the shape of the land. */
+  going: Float32Array;
 };
 
-const buildGrid = (terrain: Terrain, waterLevel: number): Grid => {
+const buildGrid = (terrain: Terrain, waterLevel: number, seed: string): Grid => {
   const cols = Math.min(GRID_MAX, Math.max(64, Math.round(terrain.size / GRID_STEP)));
   const step = terrain.size / cols;
   const origin = -terrain.size / 2 + step / 2;
@@ -375,7 +501,34 @@ const buildGrid = (terrain: Terrain, waterLevel: number): Grid => {
     }
   }
 
-  return { cols, step, origin, height, slope, water, bank, prominence, relief };
+  const goingNoise = createNoise(`${seed}:going`);
+  const going = new Float32Array(cols * cols);
+  let goingSum = 0;
+  for (let row = 0; row < cols; row += 1) {
+    for (let col = 0; col < cols; col += 1) {
+      const index = row * cols + col;
+      const value = fbm2d(goingNoise, (origin + col * step) / GOING_WAVE, (origin + row * step) / GOING_WAVE, {
+        octaves: 2,
+        frequency: 1,
+        lacunarity: 2.7,
+        gain: 0.32,
+      });
+      going[index] = value;
+      goingSum += value;
+    }
+  }
+  // Centred and normalised to -1..1. Zero mean is what keeps a route costed
+  // through this field costed in metres of ordinary road, which is the unit the
+  // admission tests in `trunkEnds`, `branchTo` and `addTrail` are calibrated in.
+  const goingMean = goingSum / (cols * cols);
+  let goingSpread = 1e-6;
+  for (let i = 0; i < going.length; i += 1) {
+    going[i] -= goingMean;
+    if (Math.abs(going[i]) > goingSpread) goingSpread = Math.abs(going[i]);
+  }
+  for (let i = 0; i < going.length; i += 1) going[i] /= goingSpread;
+
+  return { cols, step, origin, height, slope, water, bank, prominence, relief, going };
 };
 
 const cellOf = (grid: Grid, x: number, z: number): number => {
@@ -477,6 +630,8 @@ type Profile = {
   ridgePull: number;
   /** How strongly it is pulled onto the bank, which is what makes a bờ hồ path. */
   shorePull: number;
+  /** How much the going field counts. */
+  goingWeight: number;
 };
 
 const ROAD_PROFILE: Profile = {
@@ -488,6 +643,7 @@ const ROAD_PROFILE: Profile = {
   wetLimit: BRIDGE_LIMIT,
   ridgePull: 0,
   shorePull: 0,
+  goingWeight: GOING_WEIGHT,
 };
 
 const TRAIL_PROFILE: Profile = {
@@ -499,6 +655,7 @@ const TRAIL_PROFILE: Profile = {
   wetLimit: 0,
   ridgePull: 0,
   shorePull: 0,
+  goingWeight: GOING_WEIGHT,
 };
 
 /** The sống lưng khủng long profile: a path that would rather climb than leave the spine. */
@@ -522,6 +679,10 @@ const stepCost = (grid: Grid, node: number, next: number, run: number, profile: 
 
   let cost = run * (1 + (grade / profile.comfortGrade) ** 2 * 1.5);
   cost *= 1 + Math.min(grid.slope[next], 1.3) * profile.slopeWeight;
+  if (profile.goingWeight > 0) {
+    const temper = 1 - Math.min(1, grid.slope[next] / GOING_SLOPE);
+    if (temper > 0) cost *= 1 + profile.goingWeight * grid.going[next] * temper;
+  }
   if (wet) cost += run * profile.waterCost;
   if (profile.shorePull > 0) cost *= 1 - profile.shorePull * grid.bank[next];
   if (profile.ridgePull > 0 && grid.relief > 0.01) {
@@ -574,10 +735,17 @@ const findRoute = (
 
   const goalCol = goal % grid.cols;
   const goalRow = (goal - goalCol) / grid.cols;
+  // The going field discounts as well as charges, so a metre can cost less than
+  // a metre and the straight-line heuristic stops being a lower bound — an
+  // overestimate makes A* greedy, and a greedy A* returns the straight road this
+  // whole field exists to bend. Scaling by the cheapest metre the profile can
+  // produce restores the bound. (`shorePull` and `ridgePull` discount too and
+  // are not counted here; that predates the going field and is left alone.)
+  const cheapestMetre = 1 - profile.goingWeight;
   const heuristic = (node: number) => {
     const col = node % grid.cols;
     const row = (node - col) / grid.cols;
-    return Math.hypot(col - goalCol, row - goalRow) * grid.step;
+    return Math.hypot(col - goalCol, row - goalRow) * grid.step * cheapestMetre;
   };
 
   best[start] = 0;
@@ -770,37 +938,89 @@ const buildCentreline = (
     return new Vector3(grid.origin + col * grid.step, 0, grid.origin + row * grid.step);
   });
 
-  const knots = simplify(raw, grid.step * 0.8);
+  // Finer than the cell step, where it used to be most of one. The staircase is
+  // an artefact and has to go, but a tolerance that size went through the real
+  // wander with it — the going field's channels are a dozen metres wide. What
+  // keeps the staircase off the spline now is the thinning and the radius cap
+  // below, which bound it by wavelength and by curvature instead of by amplitude.
+  const simplified = simplify(raw, grid.step * 0.4);
+  if (simplified.length < 2) return null;
+
+  // Nothing closer than `KNOT_APART`, which bounds the shortest wavelength the
+  // route can carry and so the tightest bend the spline can produce. A trail is
+  // left alone: a hairpin every forty metres is what a path up a pitch is.
+  const knots: Vector3[] = [];
+  if (kind === 'trail') {
+    knots.push(...simplified);
+  } else {
+    const apart = grid.step * KNOT_APART;
+    knots.push(simplified[0]);
+    for (let i = 1; i < simplified.length - 1; i += 1) {
+      const last = knots[knots.length - 1];
+      if (Math.hypot(simplified[i].x - last.x, simplified[i].z - last.z) >= apart) knots.push(simplified[i]);
+    }
+    // The last knot is where the road was asked to arrive, so it is kept
+    // whatever its spacing; the one before it goes if it is crowding it.
+    const tail = simplified[simplified.length - 1];
+    const last = knots[knots.length - 1];
+    if (knots.length > 1 && Math.hypot(tail.x - last.x, tail.z - last.z) < apart * 0.5) knots.pop();
+    knots.push(tail);
+  }
   if (knots.length < 2) return null;
 
   // Onto the finished ribbon, not the planning cell it was surveyed from. The
-  // ease below pins index 0, so the junction stays exactly where it is put here.
+  // fade is 1 at index 0, so the junction stays exactly where it is put here and
+  // the easing below leaves it there.
   if (tie) {
     const shiftX = tie.x - knots[0].x;
     const shiftZ = tie.z - knots[0].z;
-    const span = Math.min(TIE_KNOTS, knots.length - 1);
-    for (let i = 0; i < span; i += 1) {
-      const fade = 1 - i / span;
+    let along = 0;
+    for (let i = 0; i < knots.length - 1 && along < TIE_SPREAD; i += 1) {
+      const fade = 1 - along / TIE_SPREAD;
+      along += Math.hypot(knots[i + 1].x - knots[i].x, knots[i + 1].z - knots[i].z);
       knots[i].x += shiftX * fade;
       knots[i].z += shiftZ * fade;
     }
   }
 
-  // Douglas-Peucker leaves knots thirty to sixty metres apart, and a 90° turn
-  // between two of them splines into an eight-metre radius — tighter than any
-  // road ever built, and tight enough that the traffic model crawls through it.
-  // Easing the knots laterally is the horizontal equivalent of the cut and fill
-  // applied to the height profile below; the ends are pinned so the route still
-  // arrives where it was asked to.
-  const ease = kind === 'trail' ? 1 : 3;
-  for (let pass = 0; pass < ease; pass += 1) {
+  // Lay each bend to the design radius, and leave the rest of the road alone.
+  //
+  // This used to be three passes of a lateral three-tap average over every
+  // knot, which is a low-pass filter: it rounded the hairpins it was aimed at,
+  // and it also erased every bend under about two hundred metres of wavelength,
+  // which is most of the bends there are. That is why the carriageway came out
+  // straight. Pulling a knot toward the chord of its neighbours flattens its
+  // triangle and so opens its circumradius, so weighting the pull by how far
+  // that radius falls short of `EASE_RADIUS` converges on a road whose tightest
+  // corner is the one its traffic was specified for, with everything gentler
+  // than that untouched. Deterministic: no randomness, and the early exit is on
+  // the geometry, not on a pass count.
+  const target = EASE_RADIUS[kind];
+  for (let pass = 0; pass < 40; pass += 1) {
+    let worst = 0;
     for (let i = 1; i < knots.length - 1; i += 1) {
-      knots[i].x = knots[i - 1].x * 0.25 + knots[i].x * 0.5 + knots[i + 1].x * 0.25;
-      knots[i].z = knots[i - 1].z * 0.25 + knots[i].z * 0.5 + knots[i + 1].z * 0.25;
+      const ax = knots[i].x - knots[i - 1].x;
+      const az = knots[i].z - knots[i - 1].z;
+      const bx = knots[i + 1].x - knots[i].x;
+      const bz = knots[i + 1].z - knots[i].z;
+      const chord = Math.hypot(knots[i + 1].x - knots[i - 1].x, knots[i + 1].z - knots[i - 1].z);
+      const area = Math.abs(ax * bz - az * bx) / 2;
+      // Circumradius of the three knots. Collinear knots have none, and need none.
+      const bendRadius = area > 1e-6 ? (Math.hypot(ax, az) * Math.hypot(bx, bz) * chord) / (4 * area) : Infinity;
+      const pull = Math.min(1, Math.max(0, 1 - bendRadius / target));
+      if (pull <= 0.001) continue;
+      if (pull > worst) worst = pull;
+      knots[i].x += ((knots[i - 1].x + knots[i + 1].x) / 2 - knots[i].x) * pull * 0.5;
+      knots[i].z += ((knots[i - 1].z + knots[i + 1].z) / 2 - knots[i].z) * pull * 0.5;
     }
+    if (worst < 0.02) break;
   }
 
-  const curve = new CatmullRomCurve3(knots, false, 'catmullrom', 0.5);
+  // Centripetal, not uniform. The knots are deliberately unevenly spaced — that
+  // is what Douglas-Peucker and the thinning above are for — and a uniformly
+  // parameterised Catmull-Rom overshoots on exactly that input: it was putting
+  // 9 to 14 m radii into main roads whose knots were nowhere near that tight.
+  const curve = new CatmullRomCurve3(knots, false, 'centripetal');
   const length = curve.getLength();
   if (!Number.isFinite(length) || length < SPACING * 3) return null;
 
@@ -1120,6 +1340,13 @@ const CHAIN_END = 0.05;
  * honestly describe took Hồ Tây from 1704 spans at 6.22 µs a call to 307 at 0.42,
  * and Hội An from 1644 at 6.91 to 568 at 2.47. Tràng An gains least — 1607 to 824
  * — because karst leaves nothing straight, which is the honest answer there.
+ *
+ * Those four readings are the merge's own before-and-after and are left as they
+ * were measured. What the shipped recipes produce today is more road than they
+ * had then — the hamlets are joined up and Hồ Tây has a ring round the lake —
+ * so the counts have grown back without the merge losing anything: 905 spans at
+ * 3.84 µs at Hồ Tây, 683 at 2.93 at Hội An, 1818 at 6.31 at Tràng An and 1266
+ * at 4.07 at Tà Xùa, which had 522 at 1.87 before its bản were served.
  *
  * The drift is given back as width rather than dropped, so a merged span is never
  * narrower than the surface it stands for: it is the hole in the deck that
@@ -1737,11 +1964,20 @@ export const createRoadNetwork = (
   terrain: Terrain,
   recipe: LocationRecipe,
   pois: ResolvedPoi[],
-  buildings: readonly Standing[]
+  buildings: readonly Standing[],
+  /**
+   * Where a visitor arrives, so one row of parked machines is laid beside it.
+   *
+   * Measured before this existed: the walk from the spawn to the nearest bike
+   * was 174 m at Hội An and **854 m at Tà Xùa**, which is a ridge with two rows
+   * over eight square kilometres. A ride you have to hike to is a ride most
+   * people never take.
+   */
+  arrival?: { x: number; z: number }
 ): RoadNetwork => {
   const random = createPrng(`${recipe.seed}:roads`);
   const waterLevel = recipe.water?.level ?? Number.NEGATIVE_INFINITY;
-  const grid = buildGrid(terrain, waterLevel);
+  const grid = buildGrid(terrain, waterLevel, recipe.seed);
   const hub = findHub(terrain, grid, buildings, pois);
   const hubCell = cellOf(grid, hub.x, hub.z);
 
@@ -1783,6 +2019,48 @@ export const createRoadNetwork = (
   for (const cell of mainCells) trunk[cell] = 1;
 
   const spurs: { cells: number[]; kind: RoadKind }[] = [];
+
+  /**
+   * Đường vòng quanh hồ: the trunk's two ends joined back up round the far side.
+   *
+   * `trunkEnds` picks two cells at least 135° apart and `traceBack` draws one
+   * route between them, so the carriageway a destination gets is always a line.
+   * Round a lake that is the wrong shape — at Hồ Tây the trunk came out hugging
+   * the north and east shore from the north-west corner to the south-east, and
+   * the whole south-western shore had a dirt lane and a đường mòn and no way to
+   * drive it. The real Hồ Tây has road all the way round; so does every lake
+   * anybody lives beside.
+   *
+   * Gated on the basin because a ring is a statement about a closed body of
+   * water. The admission is the one test that matters: the leg has to actually
+   * go round, measured as its furthest departure from the trunk it is closing,
+   * against the radius of the thing it is going round. A route that merely runs
+   * beside the trunk for four kilometres is a second carriageway, not a ring.
+   *
+   * `secondary`, never `main`, for the reason the far-bank trunk was: there is
+   * one highway per destination and `race-route` lays the race on the longest
+   * sealed road.
+   */
+  const basin = recipe.terrain.basin;
+  if (basin && mainCells.length >= 6) {
+    const head = mainCells[0];
+    const tail = mainCells[mainCells.length - 1];
+    const open = trunk.slice();
+    open[head] = 0;
+    open[tail] = 0;
+    const ring = findRoute(grid, head, tail, open, ROAD_PROFILE);
+    if (ring) {
+      let swing = 0;
+      for (const cell of ring.cells) {
+        swing = Math.max(swing, nearestCell(grid, mainCells, cellX(grid, cell), cellZ(grid, cell)).away);
+      }
+      if (swing > basin.radius * 0.8) {
+        spurs.push({ cells: ring.cells, kind: 'secondary' });
+        for (const cell of ring.cells) trunk[cell] = 1;
+      }
+    }
+  }
+
   // No trunk means a spur has nothing to branch from; the POIs get trails instead.
   const named =
     mainCells.length > 0 ? pois.filter((poi) => Math.hypot(poi.x - hub.x, poi.z - hub.z) > 220).slice(0, 3) : [];
@@ -1824,6 +2102,131 @@ export const createRoadNetwork = (
     edges.sort((a, b) => b.away - a.away);
     for (const outlier of edges.slice(0, 3)) {
       if (outlier.away > 260) branchTo(outlier.x, outlier.z, 'lane');
+    }
+  }
+
+  // --- the other hamlets ----------------------------------------------------
+  const hamlets = settlements(buildings);
+
+  /**
+   * A lane out to a hamlet, from the nearest thing already surveyed.
+   *
+   * Separate from `branchTo` for two reasons. It leaves from a pool that grows
+   * as lanes are laid, so the track to the third bản can leave the track to the
+   * second instead of running all the way back to the highway — which is what a
+   * valley of hamlets actually looks like, and what the comb of lanes all
+   * touching the trunk does not. And it admits a longer road: `branchTo`'s 2.6
+   * times the straight line is the right test for a spur out to a viewpoint,
+   * which nobody would build if it had to work round a shoulder twice, and the
+   * wrong one for the only way in and out of somewhere people live. The cost
+   * ceiling is what still refuses a track that would have to be benched up a
+   * mountainside for a kilometre.
+   */
+  const laneTo = (place: Settlement, pool: number[]): boolean => {
+    const target = cellOf(grid, place.x, place.z);
+    if (trunk[target] === 1 || pool.length === 0) return true;
+    const junction = nearestCell(grid, pool, place.x, place.z);
+    // Already as good as on it: a hamlet a hundred metres off the carriageway
+    // does not need its own road, it needs the verge it already has.
+    if (junction.away < MIN_LENGTH.lane) return true;
+    const open = trunk.slice();
+    open[junction.cell] = 0;
+    const route = findRoute(grid, junction.cell, target, open, ROAD_PROFILE);
+    if (!route) return false;
+    if (route.cost > Math.max(1200, junction.away * 90)) return false;
+    if (route.length > Math.max(400, junction.away * 3.6)) return false;
+    spurs.push({ cells: route.cells, kind: 'lane' });
+    for (const cell of route.cells) {
+      trunk[cell] = 1;
+      pool.push(cell);
+    }
+    return true;
+  };
+
+  /**
+   * Which piece of dry ground each hamlet stands on, because it is not always a
+   * piece any road can get to.
+   *
+   * Hồ Tây is what forced this and no longer needs it. Its recipe drew the lake
+   * as a `river` of 990 m half-width with `amplitude: 0`, which has no ending, so
+   * the water ran edge to edge of the 4200 m patch and the map was two
+   * landmasses: 5.54 km² of west bank carrying 73 of the 105 houses and 5.11 km²
+   * of east carrying the other 32, with 1325 m of water between them at the
+   * narrowest row against a `BRIDGE_LIMIT` of 440. No route from the hub could
+   * exist, so the east bank had no road, no lane, no parking and no traffic, and
+   * a player opening the world map called that half chán. The recipe is a
+   * `BasinParams` now and Hồ Tây is one landmass with a road round it.
+   *
+   * This stays because a second network is the right answer wherever the case
+   * recurs, and it recurs cheaply: Tràng An's floodplain leaves seven landmasses
+   * and Hội An's river two, and both are one parameter away from carrying a
+   * hamlet the trunk cannot bridge to.
+   */
+  const land = recipe.water ? findLandmasses(terrain, recipe.water.level) : null;
+  const homeJunctions: number[] = [...mainCells];
+  for (const spur of spurs) for (const cell of spur.cells) homeJunctions.push(cell);
+
+  /**
+   * The landmasses the roads already surveyed stand on — which is not only the
+   * hub's, because a road bridges and a walker does not.
+   *
+   * Asking whether a hamlet is on the hub's own landmass is the wrong question
+   * and gave the wrong answer: Hội An is two pieces of ground either side of the
+   * Thu Bồn, 325 m apart at the narrowest against a `BRIDGE_LIMIT` of 440, and
+   * the trunk has always crossed it. Keyed on the hub, the south bank looked
+   * stranded and got a second trunk of its own — 5536 m of asphalt laid along
+   * the same corridor as the 5079 m highway already there, and the longer of the
+   * two, which would have moved the race onto it.
+   */
+  const touched = new Set<number>();
+  for (const cell of homeJunctions) {
+    const ground = land ? land.at(cellX(grid, cell), cellZ(grid, cell)) : 0;
+    if (ground >= 0) touched.add(ground);
+  }
+
+  const abroad = new Map<number, Settlement[]>();
+  for (const place of hamlets) {
+    const ground = land ? land.at(place.x, place.z) : 0;
+    if (ground >= 0 && !touched.has(ground)) {
+      const group = abroad.get(ground);
+      if (group) group.push(place);
+      else abroad.set(ground, [place]);
+      continue;
+    }
+    laneTo(place, homeJunctions);
+  }
+
+  // One other landmass, not all of them: a second bank is a place, and the
+  // dozens of one-cell rocks a karst floodplain leaves are not. Ordered by how
+  // many houses stand there, so the one that gets the road is the one people
+  // actually live on.
+  const settled = [...abroad.values()].sort((a, b) => b.length - a.length)[0];
+  if (settled) {
+    const seat = settled.reduce((best, place) => (place.count > best.count ? place : best), settled[0]);
+    const here = snapToBuildable(grid, seat.x, seat.z, terrain.size * 0.08);
+    const seatCell = cellOf(grid, here.x, here.z);
+    const local = floodFrom(grid, seatCell, null, ROAD_PROFILE);
+    const localEnds = local ? trunkEnds(grid, local, here.x, here.z) : null;
+    const localCells: number[] = [];
+
+    if (local && localEnds) {
+      const outbound = traceBack(local.came, seatCell, localEnds[0]);
+      const inbound = localEnds[1] === localEnds[0] ? null : traceBack(local.came, seatCell, localEnds[1]);
+      if (outbound) for (let i = outbound.length - 1; i >= 0; i -= 1) localCells.push(outbound[i]);
+      if (inbound) for (let i = outbound ? 1 : 0; i < inbound.length; i += 1) localCells.push(inbound[i]);
+    }
+
+    if (localCells.length >= 6) {
+      // `secondary`, never `main`: there is one highway per destination and
+      // `race-route` lays the race on the longest sealed road, which must not
+      // become a bank nobody can drive to.
+      spurs.push({ cells: localCells, kind: 'secondary' });
+      const localJunctions: number[] = [];
+      for (const cell of localCells) {
+        trunk[cell] = 1;
+        localJunctions.push(cell);
+      }
+      for (const place of settled) laneTo(place, localJunctions);
     }
   }
 
@@ -1918,8 +2321,22 @@ export const createRoadNetwork = (
   }
   if (anchors.length === 0) anchors.push(hubCell);
 
-  const addTrail = (from: number, to: number, profile: Profile, minimum: number, slack: number): boolean => {
-    if (trails.length >= 5 || walked[to] === 1) return false;
+  const addTrail = (
+    from: number,
+    to: number,
+    profile: Profile,
+    minimum: number,
+    slack: number,
+    /**
+     * Trails already laid at which this one is refused. A ceiling rather than
+     * one constant because the named places and the hamlets are drawing on
+     * different budgets: the five below is what the POIs, the crest and the bank
+     * have always had between them, and raising it for the tracks between the
+     * bản must not quietly hand a sixth path to a viewpoint.
+     */
+    ceiling: number
+  ): boolean => {
+    if (trails.length >= ceiling || walked[to] === 1) return false;
     const straight = Math.hypot(cellX(grid, to) - cellX(grid, from), cellZ(grid, to) - cellZ(grid, from));
     if (straight < minimum) return false;
     // A trail may cross a road, so nothing is blocked for its search — only the
@@ -1950,7 +2367,14 @@ export const createRoadNetwork = (
   for (const poi of onFoot) {
     const start = nearestCell(grid, anchors, poi.x, poi.z);
     const crest = poi.kind === 'summit' || poi.kind === 'valley';
-    addTrail(start.cell, cellOf(grid, poi.x, poi.z), crest ? RIDGE_PROFILE : TRAIL_PROFILE, 130, crest ? 2.8 : 2.0);
+    addTrail(
+      start.cell,
+      cellOf(grid, poi.x, poi.z),
+      crest ? RIDGE_PROFILE : TRAIL_PROFILE,
+      130,
+      crest ? 2.8 : 2.0,
+      NAMED_TRAILS
+    );
   }
 
   // Then the spine itself, out along the crest from the high places.
@@ -1965,19 +2389,46 @@ export const createRoadNetwork = (
     // Three hundred to seven hundred metres out. The real sống lưng is a stretch
     // of spine you walk and come back from, not a traverse of the whole range.
     const out = crestTarget(grid, head, terrain.size * 0.06, terrain.size * 0.13);
-    if (out >= 0) addTrail(head, out, RIDGE_PROFILE, 170, 3.0);
+    if (out >= 0) addTrail(head, out, RIDGE_PROFILE, 170, 3.0, NAMED_TRAILS);
   }
 
   // And the bank, where there is one. A road that arrives at the water is not
   // the same thing as the path that runs along it.
   if (recipe.water) {
     // Same again: a bờ hồ path hung on a shore POI the network never reached
-    // floated 1.9 km from any road at Hồ Tây, with the whole far half of the map
-    // served by nothing else.
+    // floated 1.9 km from any road at Hồ Tây, back when a channel cut the map in
+    // two and the far half was served by nothing else.
     const bank = onFoot.find((poi) => poi.kind === 'shore');
     const head = nearestCell(grid, anchors, bank?.x ?? 0, bank?.z ?? 0).cell;
     const out = shoreTarget(grid, head, terrain.size * 0.09, terrain.size * 0.3);
-    if (out >= 0) addTrail(head, out, SHORE_PROFILE, 150, 2.2);
+    if (out >= 0) addTrail(head, out, SHORE_PROFILE, 150, 2.2, NAMED_TRAILS);
+  }
+
+  /**
+   * And a đường mòn to every hamlet a lane could not reach.
+   *
+   * This is the half of the answer the carriageway cannot give. Tà Xùa has
+   * seven bản and one drivable corridor: the trunk and its two lanes serve three
+   * of them, and the other four — measured at (-255, 532), (-465, 1028),
+   * (-19, -702) and (298, -1212) — stood on ground no grader could be benched
+   * into, which is why the ridge came back 4% within reach of a road and 92%
+   * with nothing at all. A path between two hamlets is how Bắc Yên is actually
+   * joined up, and it is the thing that was missing rather than more road.
+   *
+   * Laid last, so a bản that already has a lane is left with its lane: `walked`
+   * carries every cell of every carriageway planned above, and `addTrail`
+   * refuses a destination the network already reaches.
+   */
+  for (const place of hamlets) {
+    const start = nearestCell(grid, anchors, place.x, place.z);
+    // The same slack the spine gets, and for the same reason the spine's comment
+    // gives: `climb` is the net height difference between the two ends, which is
+    // nothing at all for a path that drops into a ravine and climbs out of it,
+    // and that is most paths on a ridge. Tà Xùa's bản of ten houses at
+    // (-465, 1028) sits 509 m from the road, reached by 1427 m of zigzag — 2.80
+    // times the straight line, refused by 74 m at 2.4 and laid at 3.0.
+    // `MAX_TRAIL_LENGTH` is the backstop, not this.
+    addTrail(start.cell, cellOf(grid, place.x, place.z), TRAIL_PROFILE, 130, 3.0, NAMED_TRAILS + HAMLET_TRAILS);
   }
 
   for (const trail of trails) addRoad('trail', trail);
@@ -2558,62 +3009,155 @@ export const createRoadNetwork = (
           )
         );
       }
-
-      if (parking.length === 0 && lampSide < 0 && i > 5) {
-        const kerb = headingAt(line, i);
-        for (let slot = 0; slot < 6; slot += 1) {
-          const along = (slot - 2.5) * 0.9;
-          const at = atSample(line, i, -(half + 1.9), 0);
-          parking.push({
-            x: at[0] - Math.sin(kerb) * along,
-            y: line.points[i * 3 + 1],
-            z: at[2] + Math.cos(kerb) * along,
-            heading: kerb + Math.PI / 2,
-          });
-        }
-      }
     }
   }
 
-  // Parked bikes are laid out beside the street lamps, and lamps only go on a
-  // trunk road. A ridge hamlet whose trunk came out as a dirt lane would get
-  // none at all, so whatever the best road is gets a row of them near the hub.
-  if (parking.length === 0) {
-    let chosen: Built | null = null;
-    let closest = Infinity;
-    for (const entry of built) {
-      if (entry.road.kind === 'trail') continue;
+  // --- where bikes are left -------------------------------------------------
+  /**
+   * Rows of kerb-side slots, spread along the sealed network.
+   *
+   * This used to sit inside the street-lamp loop and fire **once**, on the first
+   * lamp of the first road — and that loop skips any sample more than 240 m from
+   * the town hub, because that is how far the lamps go. So a five-kilometre map
+   * had exactly one place to find a motorbike, six slots 0.9 m apart against one
+   * stretch of kerb, and a rider who left one anywhere else had no way back to a
+   * second. It is a pass of its own now, with no connection to the lighting.
+   *
+   * Spaced rather than scattered: `PARK_APART` is the distance a person will walk
+   * to a bike rather than giving up, judged against the 14 m/s travel stride that
+   * is the alternative — 700 m is under a minute of it. The cap is there because
+   * these are built rigs and not instances, and because a kerb lined with bikes
+   * end to end is a dealership rather than a village.
+   *
+   * Measured as a straight line between rows and not as distance along the road,
+   * which is stricter now the roads wind: two points 700 m apart as the crow
+   * flies are further than that along a sinuous carriageway. That is the right
+   * way round, because how far you are from a bike is a question about where you
+   * are standing, not about the route.
+   */
+  const PARK_APART = 700;
+  const PARK_SLOTS = 4;
+
+  /**
+   * Trunk roads first: a bike left on a main road is reachable from more of the
+   * map than one up a lane, and the lane still gets a row once the mains are
+   * spoken for.
+   *
+   * A trail is walked, so nothing is left on one — unless a trail is all there
+   * is. The old fallback this replaces warned about exactly that case ("a ridge
+   * hamlet whose trunk came out as a dirt lane would get none at all"), and the
+   * fleet already grants that a Wave will go up a đường mòn, which is very much
+   * a Vietnamese thing. All four destinations currently produce a main road, so
+   * this branch is defensive rather than load-bearing — but a recipe is a few
+   * numbers away from not producing one.
+   */
+  const sealed = built.filter((entry) => entry.road.kind !== 'trail');
+  const parkable = (sealed.length > 0 ? sealed : built).sort(
+    (a, b) => KIND_ORDER.indexOf(a.road.kind) - KIND_ORDER.indexOf(b.road.kind)
+  );
+
+  /**
+   * How many rows, derived from how much sealed road there is to put them on.
+   *
+   * This was a flat five, written when a destination had three or four roads,
+   * and five stopped delivering what `PARK_APART` says it is for the moment the
+   * networks grew: the rows are laid greedily from the start of the trunk, so on
+   * Hồ Tây's 14.7 km of sealed road all five landed in the first 2.8 km of the
+   * highway and the whole ring round the lake had none. Measured from the
+   * spawn, the nearest motorbike was **2183 m** away — on a map whose point is
+   * that you can now drive round the water.
+   *
+   * One row per `2 * PARK_APART` of carriageway, floored at the old five so no
+   * destination loses any, capped at nine because these are built rigs and a
+   * kerb lined with bikes end to end is a dealership rather than a village. The
+   * 700 m separation is what actually spaces them, and it is still what stops Tà
+   * Xùa — 3.2 km of sealed road — from taking more than the two it has room for.
+   *
+   * And no one road may take more than its own length's share of them. The kind
+   * order below is a preference and was being read as a monopoly: at Hồ Tây it
+   * spent all nine rows walking the 6663 m highway from the north-east corner
+   * round to the south-west, and the đường vòng that carries the other half of
+   * the loop got none — which is how nine rows spread over 6 km of shore still
+   * left the spawn 2183 m from a bike. A bike on a main road really is reachable
+   * from more of the map than one up a lane; it is not reachable from the far
+   * side of a lake.
+   */
+  let sealedLength = 0;
+  for (const entry of parkable) sealedLength += entry.road.totalLength;
+  const PARK_AREAS = Math.min(9, Math.max(5, Math.round(sealedLength / (PARK_APART * 2))));
+
+  const laid: { x: number; z: number }[] = [];
+
+  /**
+   * The arrival row first, so the spacing rule lays the rest around it rather
+   * than leaving it out. It is the one row whose position is not a function of
+   * how the road happens to run: everything else is spaced every `PARK_APART`
+   * from whatever came before, and this one is spaced from the person.
+   */
+  if (arrival) {
+    let bestRoad: Built | null = null;
+    let bestAt = -1;
+    let bestGap = Infinity;
+    for (const entry of parkable) {
       for (let i = 2; i < entry.line.count - 2; i += 1) {
-        const away = Math.hypot(entry.line.points[i * 3] - hub.x, entry.line.points[i * 3 + 2] - hub.z);
-        if (away < closest) {
-          closest = away;
-          chosen = entry;
-        }
+        if (entry.line.bridge[i] === 1) continue;
+        const gap = Math.hypot(entry.line.points[i * 3] - arrival.x, entry.line.points[i * 3 + 2] - arrival.z);
+        if (gap >= bestGap) continue;
+        bestGap = gap;
+        bestRoad = entry;
+        bestAt = i;
       }
     }
 
-    if (chosen) {
-      const line = chosen.line;
-      let at = 2;
-      let nearest = Infinity;
-      for (let i = 2; i < line.count - 2; i += 1) {
-        const away = Math.hypot(line.points[i * 3] - hub.x, line.points[i * 3 + 2] - hub.z);
-        if (away < nearest) {
-          nearest = away;
-          at = i;
-        }
-      }
-      const kerb = headingAt(line, at);
-      const edge = atSample(line, at, -(chosen.road.width / 2 + 1.6), 0);
-      for (let slot = 0; slot < 5; slot += 1) {
-        const along = (slot - 2) * 0.9;
+    if (bestRoad && bestAt >= 0) {
+      const kerb = headingAt(bestRoad.line, bestAt);
+      const edge = atSample(bestRoad.line, bestAt, -(bestRoad.road.width / 2 + 1.9), 0);
+      for (let slot = 0; slot < PARK_SLOTS; slot += 1) {
+        const along = (slot - (PARK_SLOTS - 1) / 2) * 0.9;
         parking.push({
           x: edge[0] - Math.sin(kerb) * along,
-          y: line.points[at * 3 + 1],
+          y: bestRoad.line.points[bestAt * 3 + 1],
           z: edge[2] + Math.cos(kerb) * along,
           heading: kerb + Math.PI / 2,
+          area: 0,
         });
       }
+      laid.push({ x: bestRoad.line.points[bestAt * 3], z: bestRoad.line.points[bestAt * 3 + 2] });
+    }
+  }
+
+  for (const entry of parkable) {
+    if (laid.length >= PARK_AREAS) break;
+    const { line, road } = entry;
+    const stride = Math.max(1, Math.round(PARK_APART / SPACING));
+    const share =
+      sealedLength > 0 ? Math.max(1, Math.ceil((PARK_AREAS * road.totalLength) / sealedLength)) : PARK_AREAS;
+    let here = 0;
+
+    for (let i = 2; i < line.count - 2 && laid.length < PARK_AREAS && here < share; i += 1) {
+      // Not on a bridge: there is no verge over a river, and a row of bikes on a
+      // parapet is a row of bikes in the water.
+      if (line.bridge[i] === 1) continue;
+      const x = line.points[i * 3];
+      const z = line.points[i * 3 + 2];
+      if (laid.some((row) => Math.hypot(row.x - x, row.z - z) < PARK_APART)) continue;
+
+      const kerb = headingAt(line, i);
+      const edge = atSample(line, i, -(road.width / 2 + 1.9), 0);
+      const area = laid.length;
+      for (let slot = 0; slot < PARK_SLOTS; slot += 1) {
+        const along = (slot - (PARK_SLOTS - 1) / 2) * 0.9;
+        parking.push({
+          x: edge[0] - Math.sin(kerb) * along,
+          y: line.points[i * 3 + 1],
+          z: edge[2] + Math.cos(kerb) * along,
+          heading: kerb + Math.PI / 2,
+          area,
+        });
+      }
+      laid.push({ x, z });
+      here += 1;
+      i += stride;
     }
   }
 

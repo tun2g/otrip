@@ -16,6 +16,7 @@ export type BuildingType =
   | 'dinh'
   | 'nha-rong'
   | 'chua'
+  | 'mieu'
   | 'market'
   | 'granary'
   | 'pen'

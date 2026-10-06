@@ -4,6 +4,7 @@ import { buildPagoda } from './building-pagoda';
 import { buildAnimalPen, buildDryingYard, buildGranary, buildMarketShed } from './building-sheds';
 import type { Builder, BuildingType } from './building-spec';
 import { buildOldTownHouse } from './building-old-town';
+import { buildShrine } from './building-shrine';
 import { buildStiltHouse } from './building-stilt';
 
 /**
@@ -20,6 +21,7 @@ export const BUILDERS: Record<BuildingType, Builder> = {
   dinh: buildVillageHall,
   'nha-rong': buildCommunalHouse,
   chua: buildPagoda,
+  mieu: buildShrine,
   market: buildMarketShed,
   granary: buildGranary,
   pen: buildAnimalPen,
@@ -122,6 +124,25 @@ export const PLOT: Record<BuildingType, Plot> = {
     margin: 2.4,
     maxSlope: 0.18,
     maxDrop: 2.6,
+  },
+  /**
+   * Mostly sân. The shrine itself is 2.4 m across inside this, and the rest is
+   * the forecourt with its two pillars — which is why the plot is deeper than it
+   * is wide. The slope and drop allowances are a nhà sàn's rather than an đình's
+   * on purpose: a miếu is the one built thing that has to be placeable on the
+   * Tà Xùa ridge, where `PLOT.dinh`'s 0.28 gradient rules out most of the
+   * mountain and a hamlet with nothing at its centre was the thing to fix.
+   */
+  mieu: {
+    minWidth: 3.6,
+    maxWidth: 4.6,
+    minDepth: 5,
+    maxDepth: 6.4,
+    minStoreys: 1,
+    maxStoreys: 1,
+    margin: 1.6,
+    maxSlope: 0.5,
+    maxDrop: 3.4,
   },
   market: {
     minWidth: 13,

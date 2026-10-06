@@ -87,10 +87,13 @@ export const createFireflies = (terrain: Terrain, recipe: LocationRecipe, count:
    * from one of the four nights.
    *
    * 0.75 of `spread` because `spread` is how far the planner is allowed to look,
-   * not how far it built: measured at Hồ Tây the 105 houses reach 1469m against a
-   * spread of 1995m, a ratio of 0.74. Taking the whole of `spread` would reach
-   * 1995m of a 2100m half-extent and leave nowhere outside it, which is deletion
-   * wearing a keep-out's clothes.
+   * not how far it built: re-measured at Hồ Tây the 98 lots reach 1316m against a
+   * spread of 1995m, a ratio of 0.66, where the first reading of this was 105
+   * houses at 1469m for a ratio of 0.74 — the lake became a basin and the city
+   * moved round it. Taking the whole of `spread` would reach 1995m of a 2100m
+   * half-extent and leave nowhere outside it, which is deletion wearing a
+   * keep-out's clothes. The margin the 0.75 leaves has widened rather than
+   * closed, so the figure stands.
    */
   const builtUp = styleOf(recipe) === 'city' ? (recipe.town?.spread ?? 0) * (terrain.size / 2) * 0.75 : 0;
 

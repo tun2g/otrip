@@ -25,535 +25,56 @@ import {
 } from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
+import { createImpactor, type Impactor } from './driving-collision';
 import type { Obstacle } from './obstacle-index';
-import { deckChain } from './road-network';
+import {
+  assessAlignment,
+  BALLAST_CROWN_HALF,
+  BALLAST_DEPTH,
+  BRIDGE_TIMBER_LENGTH,
+  buildAlignment,
+  CESS,
+  choosePlan,
+  clamp01,
+  CUT_SLOPE,
+  FILL_SLOPE,
+  forwardX,
+  forwardZ,
+  GAUGE,
+  RAIL_ABOVE_FORMATION,
+  RAIL_CENTRES,
+  RAIL_HEAD_WIDTH,
+  RAIL_HEIGHT,
+  RAIL_LENGTH,
+  rightX,
+  rightZ,
+  SLEEPER_DEPTH,
+  SLEEPER_LENGTH,
+  SLEEPER_WIDTH,
+  STATION_STEP,
+  type Alignment,
+  type Pose,
+} from './railway-alignment';
+import {
+  buildRailFormation,
+  crossingPointAt,
+  crossingReach,
+  findRailCrossings,
+  type CrossingPoint,
+  type RailCrossing,
+  type RoadLine,
+} from './railway-formation';
 import type { Platform } from './walker';
-
-// Đường sắt Việt Nam is metre gauge throughout. Every dimension below is the
-// real one, in metres, because a railway is the one object in the scene whose
-// proportions a viewer already knows by heart.
-/** Between the inner faces of the rails. */
-const GAUGE = 1.0;
-/** Rail centre to rail centre: gauge plus one rail head width. */
-const RAIL_CENTRES = GAUGE + 0.065;
-/** 43 kg/m rail, the Vietnamese mainline section. */
-const RAIL_HEIGHT = 0.14;
-const RAIL_HEAD_WIDTH = 0.07;
-/** Standard rail length, so fishplates land where joints land. */
-const RAIL_LENGTH = 12.5;
-
-const SLEEPER_LENGTH = 1.8;
-const SLEEPER_WIDTH = 0.22;
-const SLEEPER_DEPTH = 0.16;
-/** Bridge timbers are longer than track sleepers, and it shows. */
-const BRIDGE_TIMBER_LENGTH = 2.4;
-
-/** Depth of ballast under the sleeper, plus the shoulder it stands in. */
-const BALLAST_DEPTH = 0.45;
-const BALLAST_CROWN_HALF = 1.5;
-/** Earthwork side slopes, run per unit rise. */
-const FILL_SLOPE = 1.5;
-const CUT_SLOPE = 1.2;
-/** Drainage cess between the ballast toe and the foot of a cutting. */
-const CESS = 0.8;
-
-/** Rail top above formation level — what the earthworks have to carry. */
-const RAIL_ABOVE_FORMATION = BALLAST_DEPTH + SLEEPER_DEPTH + RAIL_HEIGHT;
-
-/** Ruling grade. A locomotive hauling five coaches will not do better. */
-const MAX_GRADE = 0.025;
-const MIN_RADIUS = 420;
-/** Line speed the cant is calculated for, in m/s (70 km/h). */
-const DESIGN_SPEED = 19.4;
-/** Metre gauge cannot be canted much before a stopped train leans badly. */
-const MAX_CANT = 0.075;
-
-/** Rail level above the water on a bridge, so a sampan still fits under. */
-const BRIDGE_CLEARANCE = 6;
-/** Beyond this the embankment stops being an embankment and becomes a viaduct. */
-const VIADUCT_FILL = 11;
-const MAX_CUT = 11;
-
-/**
- * How far the sleeper tops have to stand over the ground before they are
- * published as a surface. A noise floor, not a lip: the ballast is a made surface
- * wherever there is any of it, and a threshold at the walker's step height left
- * 310 m of the Hồ Tây line unpublished where the formation is on shallow fill and
- * the crest clears the ground by less than 35 cm — measured down to 2 cm. Walking
- * those, the body stood on the original ground with the sleepers around its
- * shins.
- *
- * The 859 m still left out is every one of it in cutting, measured: the ground
- * sits at or above the crest there, and `floorAt` taking the higher of the two
- * makes the ground the floor whether a span is published or not.
- */
-const SURFACE_GAP = 0.04;
-/** Stations of line carried past each end of a raised run. Ten metres. */
-const DECK_APPROACH = 2;
-
-const STATION_STEP = 5;
-/** Coarser sampling while comparing candidate routes; the winner is resampled. */
-const SURVEY_STEP = 20;
-/** Stations at each end over which the line simply follows the ground off the map. */
-const EDGE_TAPER = 30;
 
 const UP = new Vector3(0, 1, 0);
 const Y_AXIS = new Vector3(0, 1, 0);
 
-const clamp01 = (value: number): number => Math.min(1, Math.max(0, value));
-
-const wrapAngle = (angle: number): number => {
-  let wrapped = angle;
-  while (wrapped > Math.PI) wrapped -= Math.PI * 2;
-  while (wrapped <= -Math.PI) wrapped += Math.PI * 2;
-  return wrapped;
-};
-
 /**
- * Heading is a bearing from +Z, so forward is `(sin h, 0, cos h)` and a vehicle
- * modelled along +Z needs only `rotation.y = h`. Local +X is then the right-hand
- * side of the direction of travel, which is what the cant sign depends on.
+ * Handed out whenever there is no train on the map — before the first `update`,
+ * between passes, and for the whole of a destination with no line. Shared and
+ * frozen in effect, so saying "nothing" allocates nothing sixty times a second.
  */
-const forwardX = (heading: number) => Math.sin(heading);
-const forwardZ = (heading: number) => Math.cos(heading);
-const rightX = (heading: number) => Math.cos(heading);
-const rightZ = (heading: number) => -Math.sin(heading);
-
-type Pose = { x: number; y: number; z: number; heading: number; roll: number; grade: number };
-
-type Structure = 'grade' | 'fill' | 'cut' | 'bridge';
-
-type Alignment = {
-  count: number;
-  step: number;
-  length: number;
-  x: Float64Array;
-  z: Float64Array;
-  y: Float64Array;
-  heading: Float64Array;
-  /** Signed roll angle, outer rail high. */
-  roll: Float64Array;
-  ground: Float64Array;
-  structure: Structure[];
-  at: (chainage: number, out: Pose) => Pose;
-};
-
-type Element =
-  | { kind: 'line'; x: number; z: number; heading: number; length: number }
-  | { kind: 'arc'; x: number; z: number; heading: number; length: number; curvature: number };
-
-type PlanPoint = { x: number; z: number };
-
-/**
- * Tangents joined by circular curves, which is how a railway is actually laid
- * out and the only construction that makes a minimum radius mean something. A
- * spline through the same points would quietly produce 40 m curves on a line
- * whose stock needs 400.
- */
-const buildElements = (points: PlanPoint[], random: () => number): Element[] => {
-  const elements: Element[] = [];
-  const bearings: number[] = [];
-  for (let i = 0; i < points.length - 1; i += 1) {
-    bearings.push(Math.atan2(points[i + 1].x - points[i].x, points[i + 1].z - points[i].z));
-  }
-
-  const legLength = (i: number) => Math.hypot(points[i + 1].x - points[i].x, points[i + 1].z - points[i].z);
-
-  let heading = bearings[0];
-  let tangentIn = 0;
-
-  for (let i = 0; i < points.length - 1; i += 1) {
-    const leg = legLength(i);
-    let tangentOut = 0;
-    let turn = 0;
-    let radius = 0;
-
-    if (i + 1 <= points.length - 2) {
-      turn = wrapAngle(bearings[i + 1] - heading);
-      if (Math.abs(turn) > 2e-3) {
-        // Half-tangents may never eat more than nine tenths of a leg between
-        // them, which is what keeps the straights from going negative.
-        const room = 0.45 * Math.min(leg, legLength(i + 1));
-        radius = MIN_RADIUS * (1 + random() * 1.5);
-        tangentOut = radius * Math.tan(Math.abs(turn) / 2);
-        if (tangentOut > room) {
-          tangentOut = room;
-          radius = room / Math.tan(Math.abs(turn) / 2);
-        }
-      }
-    }
-
-    const straight = leg - tangentIn - tangentOut;
-    if (straight > 0.25) {
-      elements.push({
-        kind: 'line',
-        x: points[i].x + forwardX(heading) * tangentIn,
-        z: points[i].z + forwardZ(heading) * tangentIn,
-        heading,
-        length: straight,
-      });
-    }
-
-    if (tangentOut > 0) {
-      const curvature = Math.sign(turn) / radius;
-      elements.push({
-        kind: 'arc',
-        x: points[i].x + forwardX(heading) * (leg - tangentOut),
-        z: points[i].z + forwardZ(heading) * (leg - tangentOut),
-        heading,
-        length: Math.abs(turn) * radius,
-        curvature,
-      });
-      heading += turn;
-    }
-
-    tangentIn = tangentOut;
-  }
-
-  // Legs shorter than their own half-tangents produce no straight and no curve.
-  // Returning an empty list would have `samplePlan` read `elements[0]`.
-  if (elements.length === 0 && points.length >= 2) {
-    const last = points.length - 1;
-    const span = Math.hypot(points[last].x - points[0].x, points[last].z - points[0].z);
-    elements.push({
-      kind: 'line',
-      x: points[0].x,
-      z: points[0].z,
-      heading: Math.atan2(points[last].x - points[0].x, points[last].z - points[0].z),
-      length: Math.max(1, span),
-    });
-  }
-
-  return elements;
-};
-
-type PlanSample = { x: number; z: number; heading: number; curvature: number };
-
-const samplePlan = (elements: Element[], offsets: number[], chainage: number, out: PlanSample): PlanSample => {
-  let index = 0;
-  // `index < elements.length - 1` is the positive form on purpose: written as a
-  // negation it admits a NaN chainage, and the body would then read past the end.
-  while (index < elements.length - 1 && offsets[index + 1] <= chainage) index += 1;
-  const element = elements[index];
-  const u = Math.min(element.length, Math.max(0, chainage - offsets[index]));
-
-  if (element.kind === 'line') {
-    out.x = element.x + forwardX(element.heading) * u;
-    out.z = element.z + forwardZ(element.heading) * u;
-    out.heading = element.heading;
-    out.curvature = 0;
-    return out;
-  }
-
-  const k = element.curvature;
-  const heading = element.heading + k * u;
-  out.x = element.x + (Math.cos(element.heading) - Math.cos(heading)) / k;
-  out.z = element.z + (Math.sin(heading) - Math.sin(element.heading)) / k;
-  out.heading = heading;
-  out.curvature = k;
-  return out;
-};
-
-const boxBlur = (values: Float64Array, radius: number, passes: number): Float64Array => {
-  let current = values;
-  for (let pass = 0; pass < passes; pass += 1) {
-    const source = current;
-    const next = new Float64Array(source.length);
-    for (let i = 0; i < source.length; i += 1) {
-      let sum = 0;
-      let count = 0;
-      for (let d = -radius; d <= radius; d += 1) {
-        const j = i + d;
-        if (j < 0 || j >= source.length) continue;
-        sum += source[j];
-        count += 1;
-      }
-      next[i] = sum / count;
-    }
-    current = next;
-  }
-  return current;
-};
-
-/** Forces |dy/ds| <= MAX_GRADE everywhere. The backward sweep is what guarantees
- * it: each station is clamped against a neighbour that is never touched again. */
-const limitGrade = (profile: Float64Array, step: number): void => {
-  const limit = MAX_GRADE * step;
-  for (let i = 1; i < profile.length; i += 1) {
-    if (profile[i] > profile[i - 1] + limit) profile[i] = profile[i - 1] + limit;
-    else if (profile[i] < profile[i - 1] - limit) profile[i] = profile[i - 1] - limit;
-  }
-  for (let i = profile.length - 2; i >= 0; i -= 1) {
-    if (profile[i] > profile[i + 1] + limit) profile[i] = profile[i + 1] + limit;
-    else if (profile[i] < profile[i + 1] - limit) profile[i] = profile[i + 1] - limit;
-  }
-};
-
-/**
- * The vertical profile. A road can follow the ground; a railway cannot, so this
- * finds the lowest grade-limited line that still clears the water and never cuts
- * deeper than a cutting goes, under a ceiling that tightens towards the edges of
- * the map so the line leaves it near the ground rather than on a viaduct over
- * the rim where the heightfield sinks away.
- *
- * The ceiling used to be applied afterwards, by easing the solved profile back
- * onto the ground over the last thirty stations. That is a cliff, not a taper:
- * at Tà Xùa it eased two hundred metres of height over a hundred and fifty of
- * track and produced a 175% grade on a line specified for 2.5%. Bounds belong
- * inside the relaxation, with the grade sweep last so it is the constraint that
- * survives.
- */
-const solveProfile = (ground: Float64Array, overWater: Uint8Array, step: number, waterLevel: number): Float64Array => {
-  const count = ground.length;
-  const target = new Float64Array(count);
-  const lower = new Float64Array(count);
-  const upper = new Float64Array(count);
-  const taper = Math.max(4, Math.round((EDGE_TAPER * STATION_STEP) / step));
-
-  for (let i = 0; i < count; i += 1) {
-    target[i] = overWater[i] ? waterLevel + BRIDGE_CLEARANCE : ground[i] + RAIL_ABOVE_FORMATION;
-    lower[i] = overWater[i] ? waterLevel + BRIDGE_CLEARANCE * 0.7 : ground[i] + RAIL_ABOVE_FORMATION - MAX_CUT;
-    const fromEdge = Math.min(i, count - 1 - i);
-    upper[i] = fromEdge >= taper ? Number.POSITIVE_INFINITY : target[i] + VIADUCT_FILL * clamp01(fromEdge / taper);
-  }
-
-  const blurRadius = Math.max(2, Math.round(190 / step));
-  const profile = boxBlur(target, blurRadius, 2).slice();
-
-  for (let pass = 0; pass < 14; pass += 1) {
-    for (let i = 0; i < count; i += 1) {
-      if (profile[i] < lower[i]) profile[i] = lower[i];
-      if (profile[i] > upper[i]) profile[i] = upper[i];
-    }
-    limitGrade(profile, step);
-  }
-
-  // Averaging a bounded-slope sequence cannot steepen its interior, but the
-  // window truncates at the ends, so the grade is re-imposed after it.
-  const smoothed = boxBlur(profile, 2, 1);
-  limitGrade(smoothed, step);
-  return smoothed;
-};
-
-const cantAngleFor = (curvature: number): number => {
-  if (curvature === 0) return 0;
-  const radius = 1 / Math.abs(curvature);
-  // Equilibrium cant, taken at nine tenths as practice does, capped at what
-  // metre gauge tolerates.
-  const cant = Math.min(MAX_CANT, (0.9 * RAIL_CENTRES * DESIGN_SPEED * DESIGN_SPEED) / (9.81 * radius));
-  // A right-hand curve raises the left rail, which rolls the track toward -X.
-  return -Math.sign(curvature) * Math.asin(cant / RAIL_CENTRES);
-};
-
-const buildAlignment = (
-  points: PlanPoint[],
-  random: () => number,
-  terrain: Terrain,
-  waterLevel: number,
-  step: number
-): Alignment => {
-  const elements = buildElements(points, random);
-  const offsets: number[] = [];
-  let total = 0;
-  for (const element of elements) {
-    offsets.push(total);
-    total += element.length;
-  }
-
-  const count = Math.max(2, Math.floor(total / step) + 1);
-  const x = new Float64Array(count);
-  const z = new Float64Array(count);
-  const heading = new Float64Array(count);
-  const curvature = new Float64Array(count);
-  const ground = new Float64Array(count);
-  const overWater = new Uint8Array(count);
-
-  const sample: PlanSample = { x: 0, z: 0, heading: 0, curvature: 0 };
-  for (let i = 0; i < count; i += 1) {
-    samplePlan(elements, offsets, i * step, sample);
-    x[i] = sample.x;
-    z[i] = sample.z;
-    heading[i] = sample.heading;
-    curvature[i] = sample.curvature;
-    ground[i] = terrain.heightAt(sample.x, sample.z);
-    overWater[i] = ground[i] < waterLevel - 0.2 ? 1 : 0;
-  }
-
-  const y = solveProfile(ground, overWater, step, waterLevel);
-  const roll = new Float64Array(count);
-  for (let i = 0; i < count; i += 1) roll[i] = cantAngleFor(curvature[i]);
-
-  const structure: Structure[] = new Array(count);
-  for (let i = 0; i < count; i += 1) {
-    const fill = y[i] - RAIL_ABOVE_FORMATION - ground[i];
-    if (overWater[i] || fill > VIADUCT_FILL) structure[i] = 'bridge';
-    else if (fill > 0.7) structure[i] = 'fill';
-    else if (fill < -1.1) structure[i] = 'cut';
-    else structure[i] = 'grade';
-  }
-  // A four station bridge is a culvert with ambitions, and a four station gap in
-  // the middle of one is worse. Short runs join whatever surrounds them.
-  for (let pass = 0; pass < 2; pass += 1) {
-    let runStart = 0;
-    for (let i = 1; i <= count; i += 1) {
-      if (i < count && structure[i] === structure[runStart]) continue;
-      const length = i - runStart;
-      const minimum = structure[runStart] === 'bridge' ? Math.ceil(26 / step) : Math.ceil(14 / step);
-      if (length < minimum && runStart > 0) {
-        const replacement = structure[runStart - 1];
-        for (let j = runStart; j < i; j += 1) structure[j] = replacement;
-      }
-      runStart = i;
-    }
-  }
-
-  const at = (chainage: number, out: Pose): Pose => {
-    // A NaN chainage would survive every clamp below — `Math.min(a, NaN)` is NaN
-    // and every comparison against NaN is false — and index the arrays with
-    // `undefined`, poisoning the whole pose silently. Reject it at the door.
-    const clamped = Number.isFinite(chainage) ? Math.min(total, Math.max(0, chainage)) : 0;
-    const grid = clamped / step;
-    const index = Math.max(0, Math.min(count - 2, Math.floor(grid)));
-    const f = grid - index;
-    out.x = x[index] + (x[index + 1] - x[index]) * f;
-    out.z = z[index] + (z[index + 1] - z[index]) * f;
-    out.y = y[index] + (y[index + 1] - y[index]) * f;
-    out.heading = heading[index] + (heading[index + 1] - heading[index]) * f;
-    out.roll = roll[index] + (roll[index + 1] - roll[index]) * f;
-    out.grade = (y[index + 1] - y[index]) / step;
-    return out;
-  };
-
-  return { count, step, length: total, x, z, y, heading, roll, ground, structure, at };
-};
-
-/** Deepest cutting the module will build. Past this a real line bores a tunnel,
- * which nothing here models. */
-const CUT_CEILING = MAX_CUT * 2.5;
-/** Tallest viaduct the truss design carries on dry land. */
-const FILL_CEILING = VIADUCT_FILL * 3;
-/** Longest single bridge. Cầu Long Biên is 1.7 km and is the longest in the country. */
-const MAX_BRIDGE_RUN = 1800;
-/** Past this the line is a bridge with some track attached, not a railway. */
-const MAX_BRIDGE_SHARE = 0.55;
-
-type Assessment = { buildable: boolean; cost: number; maxCut: number; maxDryFill: number; bridgeShare: number };
-
-/**
- * What the earthworks cost, and whether they are earthworks at all. Depth of
- * cutting and height of fill are not soft preferences on a railway: a 230 m cut
- * is a tunnel and a 260 m embankment is not a thing that exists, so a corridor
- * demanding either is rejected rather than merely priced.
- */
-const assessAlignment = (alignment: Alignment, waterLevel: number): Assessment => {
-  const step = alignment.step;
-  let cost = 0;
-  let maxCut = 0;
-  let maxDryFill = 0;
-  let bridgeStations = 0;
-  let run = 0;
-  let longestRun = 0;
-
-  for (let i = 0; i < alignment.count; i += 1) {
-    const fill = alignment.y[i] - RAIL_ABOVE_FORMATION - alignment.ground[i];
-    const overWater = alignment.ground[i] < waterLevel - 0.2;
-    maxCut = Math.max(maxCut, -fill);
-    if (overWater) cost += step * 46;
-    else {
-      maxDryFill = Math.max(maxDryFill, fill);
-      if (fill > VIADUCT_FILL) cost += step * 30;
-      else cost += Math.pow(Math.abs(fill), 1.35) * step * (fill > 0 ? 1 : 1.35);
-    }
-
-    if (overWater || fill > VIADUCT_FILL) {
-      bridgeStations += 1;
-      run += 1;
-      longestRun = Math.max(longestRun, run);
-    } else run = 0;
-  }
-
-  const bridgeShare = alignment.count > 0 ? bridgeStations / alignment.count : 1;
-  const buildable =
-    maxCut <= CUT_CEILING &&
-    maxDryFill <= FILL_CEILING &&
-    longestRun * step <= MAX_BRIDGE_RUN &&
-    bridgeShare <= MAX_BRIDGE_SHARE;
-
-  return { buildable, cost, maxCut, maxDryFill, bridgeShare };
-};
-
-/**
- * Route selection, done the way it is done on the ground: lay several corridors
- * across the patch, cost each one's earthworks and bridging, and build the
- * cheapest that still passes the town. Bridges are priced high per metre, which
- * is exactly what makes the line cross a river at its narrowest point instead of
- * wherever the seed first pointed it.
- *
- * Returns null when no corridor is buildable, which is a real answer and not a
- * defect — whether a place *has* a line is `recipe.railway`'s business, but
- * whether the ground can carry one is this function's, and a patch can fail the
- * second test while passing the first.
- */
-const choosePlan = (
-  terrain: Terrain,
-  waterLevel: number,
-  random: () => number,
-  town: { x: number; z: number } | null
-): PlanPoint[] | null => {
-  const half = terrain.size / 2;
-  const reach = half * 1.04;
-  let best: PlanPoint[] | null = null;
-  let bestCost = Infinity;
-
-  const scratch: PlanPoint[] = [];
-
-  for (let candidate = 0; candidate < 24; candidate += 1) {
-    const bearing = (candidate % 8) * (Math.PI / 8) + random() * 0.12;
-    const offset = ((Math.floor(candidate / 8) - 1) * 0.42 + (random() * 2 - 1) * 0.08) * half;
-
-    const axisX = forwardX(bearing);
-    const axisZ = forwardZ(bearing);
-    const acrossX = rightX(bearing);
-    const acrossZ = rightZ(bearing);
-
-    scratch.length = 0;
-    const legs = 4;
-    for (let i = 0; i <= legs; i += 1) {
-      const along = (i / legs - 0.5) * 2 * reach;
-      // The ends stay on the corridor axis so the line leaves the map square on;
-      // only the interior points of intersection wander.
-      const lateral = offset + (i === 0 || i === legs ? 0 : (random() * 2 - 1) * half * 0.26);
-      scratch.push({ x: axisX * along + acrossX * lateral, z: axisZ * along + acrossZ * lateral });
-    }
-
-    const plan = scratch.map((point) => ({ ...point }));
-    const trial = buildAlignment(plan, createPrng(`survey:${candidate}`), terrain, waterLevel, SURVEY_STEP);
-    const assessment = assessAlignment(trial, waterLevel);
-    if (!assessment.buildable) continue;
-
-    let cost = assessment.cost;
-    let closestToTown = Infinity;
-    if (town) {
-      for (let i = 0; i < trial.count; i += 1) {
-        closestToTown = Math.min(closestToTown, Math.hypot(trial.x[i] - town.x, trial.z[i] - town.z));
-      }
-      // A railway that misses the only settlement on the map is a railway nobody
-      // built, so serving the town is worth real earthwork — but as a discount
-      // on the cost, not a subtraction from it. Written as a flat bonus it was
-      // worth up to 154,000 against route costs of 40,000, which bought the
-      // Hồ Tây line a kilometre and a half of truss straight across the lake to
-      // reach a town centre on the far shore.
-      if (Number.isFinite(closestToTown)) cost *= 1 - 0.35 * clamp01((700 - closestToTown) / 700);
-    }
-
-    if (cost < bestCost) {
-      bestCost = cost;
-      best = plan;
-    }
-  }
-
-  return best;
-};
+const EMPTY_TRAFFIC: readonly Impactor[] = [];
 
 type Shop = {
   geometry: <T extends Geometry>(geometry: T) => T;
@@ -1060,15 +581,42 @@ export type Railway = {
   group: Group;
   update: (elapsed: number) => void;
   setNight: (amount: number) => void;
-  /** Embankments, bridges and the platform, for the walker's collision index. */
+  /**
+   * The ballast shoulder, the piers and the station platform, for the walker's
+   * collision index — see `railway-formation.ts`, which decides where the bank is
+   * a wall and where a level crossing cuts a hole in it.
+   */
   obstacles: Obstacle[];
   /**
-   * The formation where it stands clear of the ground — truss bridges and the
-   * embankment crest — as walkable spans, for `walker.setPlatforms`. Narrow on
-   * purpose: it is the width of the sleepers, and stepping off them on a bridge
-   * is stepping off the bridge.
+   * The formation where it stands clear of the ground, plus the road ramps at
+   * every level crossing, as walkable spans for `walker.setPlatforms`.
    */
   decks: Platform[];
+  /**
+   * Every place the line meets a carriageway, whether or not a crossing could be
+   * built there. Published because an intersection with no crossing is a wall
+   * across a public road and the only way to notice one is to count them.
+   */
+  crossings: RailCrossing[];
+  /**
+   * The train as a set of bodies that can be hit, rewritten in place at the end
+   * of every `update` and handed out by reference — the same shape
+   * `Vehicles.traffic` publishes for the road fleet, so `walker.ts` takes them in
+   * one list and neither has to know about the other.
+   *
+   * The rake is one body in several circles rather than one circle per vehicle.
+   * A coach is 19 m long and 2.9 m wide, and the circle that covers its length
+   * reaches ten metres out from the rail, which is a train that runs people over
+   * on the far side of the lineside fence; the circle that covers its width leaves
+   * a nine metre hole between every pair of coaches to stand in. So the length is
+   * covered by a chain of them and the radius stays the half-extent of the
+   * bodywork — see `TRAIN_BODY_RADIUS`.
+   *
+   * Empty before the first `update`, and empty between passes: the train is not
+   * on the map at all then, and a rake of phantom coaches parked at chainage zero
+   * is worse than none.
+   */
+  traffic: () => readonly Impactor[];
   /**
    * False when there is no line here — either `recipe.railway` is null, or the
    * terrain cannot carry one at the ruling grade. The group is then empty on
@@ -1081,6 +629,16 @@ export type Railway = {
 export type RailwayOptions = {
   /** Town buildings, so the station and the crossing land where people are. */
   buildings?: { x: number; z: number }[];
+  /**
+   * The carriageways, so that every place one meets the line gets a crossing.
+   *
+   * Optional, and what happens without it is the bug this exists for: the module
+   * used to put one crossing at the town centroid at a random skew, which at Hồ
+   * Tây is the middle of the lake, and left the line running through all three of
+   * the roads it actually crosses as a 0.6–0.8 m ledge from kerb to kerb.
+   * `world-renderer.ts` builds the roads before the railway, so it has them.
+   */
+  roads?: readonly RoadLine[];
   /** Sleeper pitch in metres. 0.6 is real; raise it to buy back instances. */
   sleeperSpacing?: number;
 };
@@ -1136,6 +694,8 @@ export const createRailway = (terrain: Terrain, recipe: LocationRecipe, options:
     setNight: () => {},
     obstacles: [],
     decks: [],
+    crossings: [],
+    traffic: () => EMPTY_TRAFFIC,
     built: false,
     dispose: () => shop.dispose(),
   });
@@ -1156,7 +716,12 @@ export const createRailway = (terrain: Terrain, recipe: LocationRecipe, options:
   // a cutting the coarse pass sampled straight over.
   if (!assessAlignment(alignment, waterLevel).buildable) return unbuilt();
 
-  const obstacles: Obstacle[] = [];
+  // Found before anything is drawn, because they decide two things that come
+  // first: where the ballast is a wall and where it is a road.
+  const crossings = findRailCrossings(alignment, options.roads ?? []);
+  const formation = buildRailFormation(alignment, crossings);
+  const obstacles: Obstacle[] = formation.obstacles;
+  const decks: Platform[] = formation.decks;
   const pose: Pose = { x: 0, y: 0, z: 0, heading: 0, roll: 0, grade: 0 };
 
   // --- permanent way -------------------------------------------------------
@@ -1500,42 +1065,54 @@ export const createRailway = (terrain: Terrain, recipe: LocationRecipe, options:
     });
   }
 
-  // --- level crossing ------------------------------------------------------
-  const crossingAnchor = townCentre ?? { x: 0, z: 0 };
-  const crossingChainage = Math.min(
-    alignment.length - 80,
-    Math.max(80, nearestChainage(crossingAnchor.x, crossingAnchor.z) + (stationChainage === null ? 0 : 230))
-  );
-  const booms: Object3D[] = [];
-  const crossingLamps: MeshBasicMaterial[] = [];
+  // --- level crossings -----------------------------------------------------
+  /**
+   * One wherever the line meets a carriageway, at that road's own bearing.
+   *
+   * There used to be exactly one, anchored on the town centroid — the middle of
+   * the lake at Hồ Tây — and set at `random() * 0.6 - 0.3 + π/2`, a skew with no
+   * road behind it. `findRailCrossings` finds the real intersections instead, and
+   * `railway-formation.ts` decides which of them a crossing belongs at: not under
+   * a truss, not over a cutting, and not where the bank is too high for a road to
+   * climb.
+   */
+  type Furniture = { crossing: RailCrossing; booms: Object3D[]; lamps: MeshBasicMaterial[] };
+  const furniture: Furniture[] = [];
   {
-    const crossing = new Object3D();
-    sideOf(crossingChainage, 0, -RAIL_ABOVE_FORMATION, crossing);
-    group.add(crossing);
-
-    const skew = random() * 0.6 - 0.3 + Math.PI / 2;
-    const road = new Object3D();
-    road.rotation.y = skew;
-    crossing.add(road);
-
-    const deckGeometry = shop.geometry(new BoxGeometry(7.2, 0.18, 30));
-    const deck = new Mesh(deckGeometry, palette.asphalt);
-    deck.position.y = RAIL_ABOVE_FORMATION - RAIL_HEIGHT - 0.09;
-    deck.receiveShadow = true;
-    road.add(deck);
-
-    // The road surface is carried up to rail level between and outside the
-    // rails, with the flangeways left open — that gap is the whole detail.
-    const panelGeometry = shop.geometry(new BoxGeometry(7.4, 0.14, GAUGE - 0.1));
-    const inner = new Mesh(panelGeometry, palette.timber);
-    inner.position.y = RAIL_ABOVE_FORMATION - RAIL_HEIGHT * 0.5;
-    road.add(inner);
-    const outerGeometry = shop.geometry(new BoxGeometry(7.4, 0.14, 0.85));
-    for (const side of [-1, 1]) {
-      const outer = new Mesh(outerGeometry, palette.timber);
-      outer.position.set(0, RAIL_ABOVE_FORMATION - RAIL_HEIGHT * 0.5, side * (RAIL_CENTRES / 2 + 0.52));
-      road.add(outer);
-    }
+    const head: CrossingPoint = { x: 0, y: 0, z: 0 };
+    const tail: CrossingPoint = { x: 0, y: 0, z: 0 };
+    /**
+     * A point on the crossing's surface, `along` metres from the rails and
+     * `across` metres to the right of the carriageway's centre — right being
+     * `(tz, -tx)` for a tangent `(tx, tz)`, the same hand `rightX`/`rightZ` take
+     * and the same hand the object's own local +X ends up on once its `rotation.y`
+     * is the road's bearing.
+     *
+     * The tangent is a central difference over the same sampler the walkable span
+     * is built from, so the furniture stands beside the ramp the feet are on even
+     * where the road is turning through the crossing. It falls back on the stored
+     * bearing at the very ends of a road, where `crossingPointAt` clamps and the
+     * difference collapses to nothing.
+     */
+    const place = (crossing: RailCrossing, along: number, across: number, into: Object3D) => {
+      crossingPointAt(crossing, along + 1, head);
+      crossingPointAt(crossing, along - 1, tail);
+      let tx = head.x - tail.x;
+      let tz = head.z - tail.z;
+      const span = Math.hypot(tx, tz);
+      if (span < 1e-3) {
+        tx = forwardX(crossing.roadHeading);
+        tz = forwardZ(crossing.roadHeading);
+      } else {
+        tx /= span;
+        tz /= span;
+      }
+      crossingPointAt(crossing, along, head);
+      into.position.set(head.x + tz * across, head.y, head.z - tx * across);
+      into.rotation.order = 'YXZ';
+      into.rotation.set(0, Math.atan2(tx, tz), 0);
+      return into;
+    };
 
     const baseGeometry = shop.geometry(new BoxGeometry(0.6, 0.5, 0.6));
     const mastGeometry = shop.geometry(new CylinderGeometry(0.1, 0.12, 2.6, 7));
@@ -1544,55 +1121,120 @@ export const createRailway = (terrain: Terrain, recipe: LocationRecipe, options:
     const boomWhiteGeometry = shop.geometry(new BoxGeometry(0.1, 0.22, 0.9));
     const crossGeometry = shop.geometry(new BoxGeometry(0.1, 1.5, 0.22));
     const lensGeometry = shop.geometry(new CircleGeometry(0.17, 10));
-    const warning = lamp('#ff2e18', 0.12, 1);
-    crossingLamps.push(warning);
-    const warningSecond = lamp('#ff2e18', 0.12, 1);
-    crossingLamps.push(warningSecond);
 
-    // Diagonally opposite corners, as a real crossing is gated.
-    for (const [corner, lampMaterial] of [
-      [1, warning],
-      [-1, warningSecond],
-    ] as const) {
-      const gate = new Object3D();
-      gate.position.set(corner * 4.6, RAIL_ABOVE_FORMATION - RAIL_HEIGHT, corner * -4.2);
-      gate.rotation.y = corner > 0 ? 0 : Math.PI;
-      road.add(gate);
+    for (const crossing of crossings) {
+      if (crossing.kind !== 'level') continue;
+      const half = crossing.road.width / 2;
+      const reach = crossingReach(crossing);
 
-      const base = new Mesh(baseGeometry, palette.concrete);
-      base.position.y = 0.25;
-      gate.add(base);
-      const mast = new Mesh(mastGeometry, palette.paintWhite);
-      mast.position.y = 1.6;
-      mast.castShadow = true;
-      gate.add(mast);
-
-      for (const arm of [-1, 1]) {
-        const cross = new Mesh(crossGeometry, palette.paintWhite);
-        cross.position.set(0, 2.9, 0);
-        cross.rotation.x = arm * 0.78;
-        gate.add(cross);
+      // The asphalt, swept along the same profile `crossingSpans` turned into
+      // walkable rectangles. Drawn as a ribbon and not as a box because the deck
+      // is a hump with a ramp off each end of it, and a box is flat: laid as one,
+      // the surface a foot stood on and the surface a player saw were 0.77 m
+      // apart at the toe of the ramp.
+      const surface = createRibbon(2);
+      const edge = Math.max(4, Math.round(reach / 1.5));
+      for (let n = -edge; n <= edge; n += 1) {
+        const along = (n / edge) * reach;
+        crossingPointAt(crossing, along + 1, head);
+        crossingPointAt(crossing, along - 1, tail);
+        let tx = head.x - tail.x;
+        let tz = head.z - tail.z;
+        const span = Math.hypot(tx, tz) || 1;
+        tx /= span;
+        tz /= span;
+        crossingPointAt(crossing, along, head);
+        // Left edge first, then right, because `pushRibbonRow` winds each quad
+        // from the lower column index to the higher one: pushed the other way
+        // round, `computeVertexNormals` gives the whole deck a normal of
+        // `(0, -2 * half * dAlong, 0)` and a single-sided asphalt is then only
+        // visible from underneath the map. Every other ribbon in this file sweeps
+        // its columns across from negative to positive for the same reason.
+        //
+        // Two millimetres over the walkable surface, so the carriageway's own
+        // deck does not z-fight with this one where the ramp has come back down
+        // onto it.
+        surface.positions.push(head.x - tz * half, head.y + 0.002, head.z + tx * half);
+        surface.positions.push(head.x + tz * half, head.y + 0.002, head.z - tx * half);
+        pushRibbonRow(surface);
       }
-      const lens = new Mesh(lensGeometry, lampMaterial);
-      lens.position.set(0, 2.3, 0.14);
-      gate.add(lens);
+      addStatic(ribbonGeometry(surface), palette.asphalt, false);
 
-      const boom = new Object3D();
-      boom.position.set(0, 1.5, 0.18);
-      gate.add(boom);
-      booms.push(boom);
-
-      const counterweight = new Mesh(counterGeometry, palette.paintWhite);
-      counterweight.position.z = -0.6;
-      boom.add(counterweight);
-      // Five alternating blocks make a striped boom for the price of five boxes.
-      for (let band = 0; band < 5; band += 1) {
-        const red = band % 2 === 0;
-        const block = new Mesh(red ? boomRedGeometry : boomWhiteGeometry, red ? palette.paintRed : palette.paintWhite);
-        block.position.z = 0.55 + band * 1.0;
-        block.castShadow = true;
-        boom.add(block);
+      // The road surface is carried up to rail level between and outside the
+      // rails, with the flangeways left open — that gap is the whole detail. The
+      // chord is the carriageway's width divided by the obliquity, because an
+      // oblique crossing presents a longer face to the rails than a square one.
+      const chord = Math.min(40, crossing.road.width / Math.max(0.15, Math.sin(crossing.skew)));
+      const infill = new Object3D();
+      alignment.at(crossing.chainage, pose);
+      infill.position.set(pose.x, pose.y - RAIL_HEIGHT * 0.5, pose.z);
+      infill.rotation.order = 'YXZ';
+      infill.rotation.set(0, pose.heading, 0);
+      group.add(infill);
+      const inner = new Mesh(shop.geometry(new BoxGeometry(chord, 0.14, GAUGE - 0.1)), palette.timber);
+      infill.add(inner);
+      for (const side of [-1, 1]) {
+        const outer = new Mesh(shop.geometry(new BoxGeometry(chord, 0.14, 0.85)), palette.timber);
+        outer.position.z = side * (RAIL_CENTRES / 2 + 0.52);
+        infill.add(outer);
       }
+
+      const booms: Object3D[] = [];
+      const warnings: MeshBasicMaterial[] = [];
+      // Diagonally opposite corners, as a real crossing is gated.
+      for (const corner of [1, -1] as const) {
+        const gate = place(crossing, corner * -(crossing.deckHalf + 1.4), corner * (half + 0.8), new Object3D());
+        // Turned a quarter the other way from the carriageway, so the boom lies
+        // *across* the road when it comes down. Written without this it lay along
+        // the road, pointing at the rails, blocking nothing.
+        gate.rotation.y += corner * -Math.PI * 0.5;
+        group.add(gate);
+
+        const base = new Mesh(baseGeometry, palette.concrete);
+        base.position.y = 0.25;
+        gate.add(base);
+        const mast = new Mesh(mastGeometry, palette.paintWhite);
+        mast.position.y = 1.6;
+        mast.castShadow = true;
+        gate.add(mast);
+
+        for (const arm of [-1, 1]) {
+          const cross = new Mesh(crossGeometry, palette.paintWhite);
+          cross.position.set(0, 2.9, 0);
+          cross.rotation.x = arm * 0.78;
+          gate.add(cross);
+        }
+        const warning = lamp('#ff2e18', 0.12, 1);
+        warnings.push(warning);
+        const lens = new Mesh(lensGeometry, warning);
+        lens.position.set(0, 2.3, 0.14);
+        gate.add(lens);
+
+        const boom = new Object3D();
+        boom.position.set(0, 1.5, 0.18);
+        // Five one-metre blocks reach 5 m from the mast, which is a boom for a
+        // 7.2 m trunk road and a boom and a half for a 3 m lane. Scaled along its
+        // own length so it reaches the far kerb of whatever it is standing on.
+        boom.scale.z = (half + 0.8) / 5;
+        gate.add(boom);
+        booms.push(boom);
+
+        const counterweight = new Mesh(counterGeometry, palette.paintWhite);
+        counterweight.position.z = -0.6;
+        boom.add(counterweight);
+        // Five alternating blocks make a striped boom for the price of five boxes.
+        for (let band = 0; band < 5; band += 1) {
+          const red = band % 2 === 0;
+          const block = new Mesh(
+            red ? boomRedGeometry : boomWhiteGeometry,
+            red ? palette.paintRed : palette.paintWhite
+          );
+          block.position.z = 0.55 + band * 1.0;
+          block.castShadow = true;
+          boom.add(block);
+        }
+      }
+      furniture.push({ crossing, booms, lamps: warnings });
     }
   }
 
@@ -1990,54 +1632,6 @@ export const createRailway = (terrain: Terrain, recipe: LocationRecipe, options:
   let smokeCursor = 0;
   let nextPuff = 0;
 
-  // --- somewhere to walk ---------------------------------------------------
-  // Walking the line is how people here actually get along a valley, and it is
-  // the only way onto the bridges: the flanks of an embankment are walls, so the
-  // way up is along the formation from where it meets the ground.
-  /** Top of the sleepers, which is what a foot lands on — bridge timber or not. */
-  const crestOf = (i: number) => alignment.y[i] - RAIL_HEIGHT;
-  const decks: Platform[] = [];
-  const deckPoints: number[] = [];
-  let raisedFrom = -1;
-  for (let i = 0; i <= alignment.count; i += 1) {
-    if (i < alignment.count && crestOf(i) - alignment.ground[i] > SURFACE_GAP) {
-      if (raisedFrom < 0) raisedFrom = i;
-      continue;
-    }
-    if (raisedFrom < 0) continue;
-    // A run is already maximal in how far it stands clear, so carrying it two
-    // stations further each way lands it under the ground rather than on it.
-    const head = Math.max(0, raisedFrom - DECK_APPROACH);
-    const tail = Math.min(alignment.count - 1, i - 1 + DECK_APPROACH);
-    raisedFrom = -1;
-
-    deckPoints.length = 0;
-    for (let at = head; at <= tail; at += 1) deckPoints.push(alignment.x[at], crestOf(at), alignment.z[at]);
-    deckChain(deckPoints, SLEEPER_LENGTH / 2, decks);
-  }
-
-  // --- obstacles -----------------------------------------------------------
-  for (let i = 0; i < alignment.count; i += Math.max(1, Math.round(12 / alignment.step))) {
-    const fill = alignment.y[i] - RAIL_ABOVE_FORMATION - alignment.ground[i];
-    if (fill < 1.2) continue;
-    // A bridge is piers and a deck. The piers are obstacles of their own, and a
-    // cylinder from the bed to the parapet on top of them would both shove
-    // anyone off the deck they are standing on and wall a swimmer out of the
-    // whole river underneath it.
-    if (alignment.structure[i] === 'bridge') continue;
-    obstacles.push({
-      x: alignment.x[i],
-      z: alignment.z[i],
-      radius: BALLAST_CROWN_HALF + FILL_SLOPE * Math.min(fill, VIADUCT_FILL) * 0.5,
-      bottom: alignment.ground[i],
-      // The crest, not the rails above it: `gatherContacts` ignores anything
-      // whose top is within a step of the foot, so publishing the walking
-      // surface makes an embankment a wall from the side and a floor from on
-      // top. Carrying it 0.4 m higher made it a wall from both.
-      top: crestOf(i),
-    });
-  }
-
   // --- running -------------------------------------------------------------
   const SPEED = 19.4;
   const DWELL = stationChainage === null ? 0 : 26;
@@ -2067,7 +1661,69 @@ export const createRailway = (terrain: Terrain, recipe: LocationRecipe, options:
     return stopAt + (t - arriveAt - DWELL) * SPEED;
   };
 
+  // --- the train as something that can be hit ------------------------------
+  /**
+   * Mass of the rake, in kilogrammes, and every published body carries the whole
+   * of it.
+   *
+   * A D19E is 80 t and a metre gauge coach about 32 t tare, so Hồ Tây's five-car
+   * train is 240 t; the recipe allows three to nine carriages, which is 176 t to
+   * 368 t. The whole rake and not one vehicle because the vehicles are coupled:
+   * hitting the third coach is hitting the train, and nothing a person can do to
+   * the third coach is resisted by 32 t of it alone.
+   *
+   * Finite, and deliberately not `Infinity`. `driving-collision.ts` documents
+   * `Infinity` as meaning the world — a house, a cliff — and a train is not the
+   * world, it moves, and its velocity is most of what makes being hit by one
+   * different from walking into a wall. The arithmetic needs no special case
+   * either way: `collideDrive` splits the push by inverse mass, and 1/240000
+   * against a xe máy's 1/175 leaves the train with 0.07% of it. Measured, a
+   * motorbike struck square takes 99.93% of the separation and the train takes
+   * 7 mm.
+   */
+  const TRAIN_MASS = 80_000 + carriageCount * 32_000;
+
+  /**
+   * Half-extent of the bodywork, which is what a body has to come inside to be
+   * hit. A metre gauge coach is 2.9 m over the panels and the loco's handrails
+   * stand out to 1.61 m from the centreline, so this is the widest part of the
+   * train and not an average of its plan.
+   *
+   * `Vehicles.traffic` uses `(length + width) / 4` for a road vehicle, which for
+   * a 19 m coach would be 5.5 m — a train that runs you over from the far side of
+   * the lineside fence. The length is covered by the chain below instead.
+   */
+  const TRAIN_BODY_RADIUS = 1.7;
+
+  /**
+   * Metres of chainage between published bodies: twice the radius, so the circles
+   * are tangent and nothing is ever deep inside two of them at once.
+   *
+   * Overlapping them is the thing to avoid rather than the thing to want. The
+   * walker sums the separation it owes every body it is inside, and `collideDrive`
+   * applies one impulse and one yaw kick per body — so a rider inside three
+   * circles takes three impulses and up to three times `SPIN_CAP`, which is the
+   * blender that constant exists to prevent. Tangent, a point is inside at most
+   * one; and the gap at the tangency closes anyway once the other party's own
+   * radius is added, which is 0.45 m for a body on foot and about 0.9 m for a xe
+   * máy, against a 3.4 m pitch.
+   */
+  const TRAIN_BODY_PITCH = TRAIN_BODY_RADIUS * 2;
+
+  const trainBodies: Impactor[] = [];
+  for (let n = 0; n < Math.ceil(trainLength / TRAIN_BODY_PITCH) + 1; n += 1) trainBodies.push(createImpactor());
+  let live: readonly Impactor[] = EMPTY_TRAFFIC;
+  const bodyPose: Pose = { x: 0, y: 0, z: 0, heading: 0, roll: 0, grade: 0 };
+
   let lastDistance = 0;
+  /**
+   * The head's chainage at the previous `update`, and the elapsed time it was
+   * read at — the pair the bodies' velocity is differenced from. Kept apart from
+   * `lastDistance`, which is reset to zero between passes to re-seed the wheel
+   * spin and would read as the train teleporting to the start of the line.
+   */
+  let lastHead = 0;
+  let lastElapsed = -1;
   let wheelAngle = 0;
   let night = 0;
 
@@ -2079,18 +1735,24 @@ export const createRailway = (terrain: Terrain, recipe: LocationRecipe, options:
 
     if (!running) {
       lastDistance = 0;
+      live = EMPTY_TRAFFIC;
       for (const signal of signals) {
         signal.red.visible = false;
         signal.yellow.visible = false;
         signal.green.visible = true;
       }
-      for (const boom of booms) boom.rotation.x = -1.35;
-      for (const material of crossingLamps) material.visible = false;
+      for (const gated of furniture) {
+        for (const boom of gated.booms) boom.rotation.x = -1.35;
+        for (const material of gated.lamps) material.visible = false;
+      }
       smokeMaterial.uniforms.uTime.value = elapsed;
       return;
     }
 
     const head = chainageAt(t);
+    const delta = lastElapsed < 0 ? 0 : Math.min(0.25, Math.max(0, elapsed - lastElapsed));
+    lastElapsed = elapsed;
+    if (lastDistance === 0) lastHead = head;
     const speed = lastDistance === 0 ? SPEED : Math.abs(head - lastDistance);
     wheelAngle -= (head - lastDistance) / vehicles[0].wheelRadius;
     lastDistance = head;
@@ -2179,18 +1841,46 @@ export const createRailway = (terrain: Terrain, recipe: LocationRecipe, options:
       signal.green.visible = !behind && !approach;
     }
 
-    const distanceToCrossing = Math.min(
-      Math.abs(crossingChainage - head),
-      Math.abs(crossingChainage - tail),
-      crossingChainage > tail && crossingChainage < head ? 0 : Infinity
-    );
-    const closing = clamp01((260 - distanceToCrossing) / 60);
-    for (const boom of booms) boom.rotation.x = -1.35 * (1 - closing);
-    const flashing = closing > 0.02;
-    for (const [index, material] of crossingLamps.entries()) {
-      material.visible = flashing && (Math.floor(elapsed * 1.6) + index) % 2 === 0;
-      material.opacity = night > 0.1 ? 1 : 0.5;
+    // Each crossing against the train that is actually coming to it. This was
+    // already driven by the train's distance and was already correct; what was
+    // wrong was that there was one crossing and it was nowhere near a road, so a
+    // boom that works has been coming down over a field.
+    for (const gated of furniture) {
+      const at = gated.crossing.chainage;
+      const distance = Math.min(Math.abs(at - head), Math.abs(at - tail), at > tail && at < head ? 0 : Infinity);
+      const closing = clamp01((260 - distance) / 60);
+      for (const boom of gated.booms) boom.rotation.x = -1.35 * (1 - closing);
+      const flashing = closing > 0.02;
+      for (const [index, material] of gated.lamps.entries()) {
+        material.visible = flashing && (Math.floor(elapsed * 1.6) + index) % 2 === 0;
+        material.opacity = night > 0.1 ? 1 : 0.5;
+      }
     }
+
+    /**
+     * And the train as a body. Last, so it reports where the rake was drawn this
+     * frame and not where it was drawn last.
+     *
+     * Every circle is placed by chainage on the alignment, which is why the rake
+     * is solid around a curve rather than solid only on the straights: each body
+     * sits on the rail and takes the rail's own tangent for its velocity. The
+     * speed is `head - lastDistance` over the frame rather than `SPEED`, so a
+     * train standing in the platform publishes bodies that are not moving and
+     * walking into one is walking into a parked coach.
+     */
+    const velocity = delta > 0 ? (head - lastHead) / delta : SPEED;
+    for (let n = 0; n < trainBodies.length; n += 1) {
+      const body = trainBodies[n];
+      alignment.at(head - n * TRAIN_BODY_PITCH, bodyPose);
+      body.x = bodyPose.x;
+      body.z = bodyPose.z;
+      body.vx = forwardX(bodyPose.heading) * velocity;
+      body.vz = forwardZ(bodyPose.heading) * velocity;
+      body.mass = TRAIN_MASS;
+      body.radius = TRAIN_BODY_RADIUS;
+    }
+    live = trainBodies;
+    lastHead = head;
   };
 
   const setNight = (amount: number) => {
@@ -2216,6 +1906,8 @@ export const createRailway = (terrain: Terrain, recipe: LocationRecipe, options:
     setNight,
     obstacles,
     decks,
+    crossings,
+    traffic: () => live,
     built: true,
     dispose: () => {
       shop.dispose();
