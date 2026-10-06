@@ -1,222 +1,15 @@
 import { createPrng, type LocationRecipe, type Terrain } from '@otrip/world';
-import {
-  AdditiveBlending,
-  BufferAttribute,
-  BufferGeometry,
-  Color,
-  ConeGeometry,
-  DoubleSide,
-  Group,
-  Mesh,
-  MeshBasicMaterial,
-  MeshStandardMaterial,
-  Object3D,
-  SphereGeometry,
-  TorusGeometry,
-  Vector3,
-  type Material,
-} from 'three';
+import { Group, Mesh, Vector3 } from 'three';
 
+import { createImpactor, tuneDrive, type DriveSpec, type Impactor } from './driving';
 import type { Machine, Rideable, Ridden } from './life';
 import { styleOf, type TownStyle } from './town-styles';
-import {
-  box,
-  mergeParts,
-  strut,
-  tube,
-  type ParkingSpot,
-  type Part,
-  type RoadKind,
-  type RoadNetwork,
-  type RoadSample,
-} from './road-network';
+import type { ParkingSpot, RoadKind, RoadNetwork, RoadSample } from './road-network';
+import { buildFor, motorbikeBuild, PAINT } from './vehicle-builds';
+import { COCKPIT_LAYER, createVehicleKit, type Rig, type VehicleKit } from './vehicle-kit';
+import { GRAVITY, SPECS, type Spec, type VehicleKind } from './vehicle-specs';
+import { pick } from './vehicle-parts';
 import type { WorldWeather } from './weather-state';
-
-/**
- * Local +Z is the way a vehicle faces and local +Y is up, which in a
- * right-handed frame puts the driver's right hand on local **−X**. Vietnam
- * drives on the right, so the kerb, the exhaust, the coach door and the lane
- * offset all live on that side; getting the sign wrong puts the whole fleet in
- * the oncoming lane.
- */
-const RIGHT = -1;
-
-const GRAVITY = 9.81;
-
-const smoothstep = (edge0: number, edge1: number, value: number) => {
-  const t = Math.min(1, Math.max(0, (value - edge0) / (edge1 - edge0)));
-  return t * t * (3 - 2 * t);
-};
-
-export type VehicleKind =
-  | 'motorbike'
-  | 'motorbike-cargo'
-  | 'car'
-  | 'truck'
-  | 'coach'
-  | 'bicycle'
-  | 'cyclo'
-  | 'buffalo-cart';
-
-type Spec = {
-  length: number;
-  width: number;
-  wheelRadius: number;
-  /** Axle positions along Z, from the vehicle's own origin. */
-  frontAxle: number;
-  rearAxle: number;
-  /**
-   * Roll into a bend, as a multiple of the angle a free body would take. A
-   * motorbike leans the whole of it; a car's suspension lets the body roll a
-   * little the *other* way, which is why this is negative on four wheels.
-   */
-  leanGain: number;
-  /** m/s on an open straight. */
-  cruise: number;
-  /** Lateral acceleration it will take through a bend, m/s². */
-  grip: number;
-  accel: number;
-  brake: number;
-  steersFront: boolean;
-  /** Whether the headlight turns with the bars. True only on two wheels. */
-  lampOnSteer: boolean;
-  /** Metres it wants between its nose and the tail in front. */
-  gap: number;
-  roads: RoadKind[];
-};
-
-const SPECS: Record<VehicleKind, Spec> = {
-  // Honda Wave: 1.95 m over the mudguards, 1.24 m wheelbase, 17-inch wheels. The
-  // whole fleet is scaled against this one because it is what there are most of.
-  motorbike: {
-    length: 1.95,
-    width: 0.72,
-    wheelRadius: 0.215,
-    frontAxle: 0.62,
-    rearAxle: -0.62,
-    leanGain: 1,
-    cruise: 11.5,
-    grip: 5.2,
-    accel: 3.4,
-    brake: 5.4,
-    steersFront: true,
-    lampOnSteer: true,
-    gap: 6,
-    roads: ['main', 'secondary', 'lane', 'trail'],
-  },
-  'motorbike-cargo': {
-    length: 1.95,
-    width: 0.98,
-    wheelRadius: 0.215,
-    frontAxle: 0.62,
-    rearAxle: -0.62,
-    leanGain: 0.82,
-    cruise: 8.4,
-    grip: 3.9,
-    accel: 2.1,
-    brake: 4.2,
-    steersFront: true,
-    lampOnSteer: true,
-    gap: 7,
-    roads: ['main', 'secondary', 'lane'],
-  },
-  car: {
-    length: 4.3,
-    width: 1.8,
-    wheelRadius: 0.31,
-    frontAxle: 1.3,
-    rearAxle: -1.3,
-    leanGain: -0.2,
-    cruise: 13.5,
-    grip: 4.6,
-    accel: 2.6,
-    brake: 5.8,
-    steersFront: true,
-    lampOnSteer: false,
-    gap: 11,
-    roads: ['main', 'secondary'],
-  },
-  truck: {
-    length: 5.4,
-    width: 1.95,
-    wheelRadius: 0.33,
-    frontAxle: 1.52,
-    rearAxle: -1.28,
-    leanGain: -0.3,
-    cruise: 10.4,
-    grip: 3.3,
-    accel: 1.4,
-    brake: 4.2,
-    steersFront: true,
-    lampOnSteer: false,
-    gap: 15,
-    roads: ['main', 'secondary', 'lane'],
-  },
-  coach: {
-    length: 10.5,
-    width: 2.5,
-    wheelRadius: 0.52,
-    frontAxle: 3.1,
-    rearAxle: -2.1,
-    leanGain: -0.34,
-    cruise: 12,
-    grip: 2.9,
-    accel: 1,
-    brake: 3.6,
-    steersFront: true,
-    lampOnSteer: false,
-    gap: 24,
-    roads: ['main', 'secondary'],
-  },
-  bicycle: {
-    length: 1.75,
-    width: 0.56,
-    wheelRadius: 0.34,
-    frontAxle: 0.53,
-    rearAxle: -0.52,
-    leanGain: 0.85,
-    cruise: 4.6,
-    grip: 2.9,
-    accel: 1.3,
-    brake: 2.8,
-    steersFront: true,
-    lampOnSteer: true,
-    gap: 4,
-    roads: ['main', 'secondary', 'lane'],
-  },
-  cyclo: {
-    length: 2.9,
-    width: 1.22,
-    wheelRadius: 0.33,
-    frontAxle: 0.95,
-    rearAxle: -1.05,
-    leanGain: 0.12,
-    cruise: 3.3,
-    grip: 2.3,
-    accel: 0.9,
-    brake: 2.4,
-    steersFront: false,
-    lampOnSteer: false,
-    gap: 6,
-    roads: ['secondary', 'lane'],
-  },
-  'buffalo-cart': {
-    length: 4.2,
-    width: 1.62,
-    wheelRadius: 0.6,
-    frontAxle: 1.9,
-    rearAxle: -0.3,
-    leanGain: 0,
-    cruise: 1.1,
-    grip: 1.5,
-    accel: 0.5,
-    brake: 1.4,
-    steersFront: false,
-    lampOnSteer: false,
-    gap: 9,
-    roads: ['lane'],
-  },
-};
 
 /**
  * The fleet, in the order it is dealt out, cut to whatever count the caller
@@ -315,881 +108,6 @@ const ROSTERS: Record<TownStyle, VehicleKind[]> = {
   ],
 };
 
-/**
- * Everything one vehicle is made of, grouped by what moves it. Every list is in
- * the vehicle's own coordinates with y = 0 at the tyre contact patch; the
- * assembler is what shifts a list into the frame of the node that carries it.
- */
-type Build = {
-  /** Static bodywork. Merged into one vertex-coloured geometry, so one draw call. */
-  body: Part[];
-  glass: Part[];
-  /** Fork, bars, front mudguard — whatever turns with the steering. */
-  steer: Part[];
-  frontWheel: Part[];
-  rearWheel: Part[];
-  /** Leans and bobs with the machine. */
-  rider: Part[];
-  /** Pivots about X, for cranks that are pedalled and legs that walk. */
-  swing: { parts: Part[]; at: [number, number, number]; phase: number; gain: number }[];
-  head: Part[];
-  tail: Part[];
-  /** Where the headlight glow cone starts. Null means it carries no lights. */
-  lamp: [number, number, number] | null;
-};
-
-const emptyBuild = (): Build => ({
-  body: [],
-  glass: [],
-  steer: [],
-  frontWheel: [],
-  rearWheel: [],
-  rider: [],
-  swing: [],
-  head: [],
-  tail: [],
-  lamp: null,
-});
-
-// --- shared primitives --------------------------------------------------------
-
-/**
- * Sweeps a closed cross-section along Z and caps both ends. One call is a whole
- * shell: the silhouette comes out of the station functions rather than out of a
- * stack of boxes, which is the difference between a car and a crate.
- */
-const loft = (stations: number[], ring: (z: number, index: number) => [number, number][], color: string): Part => {
-  const positions: number[] = [];
-  const indices: number[] = [];
-  const rings = stations.map((z, index) => ring(z, index));
-  const points = rings[0].length;
-
-  rings.forEach((entries, index) => {
-    for (const point of entries) positions.push(point[0], point[1], stations[index]);
-  });
-
-  for (let i = 0; i + 1 < rings.length; i += 1) {
-    const a = i * points;
-    const b = a + points;
-    for (let p = 0; p < points; p += 1) {
-      const next = (p + 1) % points;
-      indices.push(a + p, a + next, b + next, a + p, b + next, b + p);
-    }
-  }
-
-  for (let p = 1; p + 1 < points; p += 1) indices.push(0, p + 1, p);
-  const tail = (rings.length - 1) * points;
-  for (let p = 1; p + 1 < points; p += 1) indices.push(tail, tail + p, tail + p + 1);
-
-  const geometry = new BufferGeometry();
-  geometry.setAttribute('position', new BufferAttribute(new Float32Array(positions), 3));
-  geometry.setIndex(indices);
-  geometry.computeVertexNormals();
-  return { geometry, color };
-};
-
-/** A rounded-rectangle section, bottom-left round to top-left. `taper` narrows the roof. */
-const slab = (half: number, floor: number, roof: number, taper: number): [number, number][] => {
-  const lift = Math.min(0.2, (roof - floor) * 0.24);
-  const top = half * taper;
-  return [
-    [-half, floor + lift],
-    [-half * 0.74, floor],
-    [half * 0.74, floor],
-    [half, floor + lift],
-    [half, roof - lift],
-    [top * 0.88, roof],
-    [-top * 0.88, roof],
-    [-half, roof - lift],
-  ];
-};
-
-/**
- * How much the body's underside has to rise at this station to clear a wheel.
- * A low-poly body cannot have a hole cut in it, so the arch is built into the
- * sweep instead — and that bulge over each axle is most of what makes a body
- * shell read as a car rather than a shoebox.
- */
-const archLift = (z: number, axles: number[], reach: number) => {
-  let most = 0;
-  for (const axle of axles) most = Math.max(most, 1 - smoothstep(reach * 0.55, reach, Math.abs(z - axle)));
-  return most;
-};
-
-/**
- * One wheel at an offset along the axle. The tyre is a torus rather than a disc
- * because the profile is the first thing the eye checks on a wheel, and the
- * spokes are what make it obviously turning rather than sliding.
- */
-const wheel = (radius: number, width: number, offset: number, spokes: number, rim = '#9a9ea1'): Part[] => {
-  const parts: Part[] = [];
-  const section = width * 0.36;
-
-  const tyre = new TorusGeometry(radius - section, section, 6, 16);
-  tyre.rotateY(Math.PI / 2);
-  tyre.translate(offset, 0, 0);
-  parts.push({ geometry: tyre, color: '#1b1b1d' });
-
-  parts.push(
-    tube([radius - section * 1.7, radius - section * 1.7], width * 0.42, [offset, 0, 0], rim, [0, 0, Math.PI / 2], 14)
-  );
-  parts.push(tube([width * 0.34, width * 0.34], width * 1.16, [offset, 0, 0], '#6e7275', [0, 0, Math.PI / 2], 8));
-
-  for (let s = 0; s < spokes; s += 1) {
-    const spoke = box([width * 0.16, (radius - section * 1.8) * 2, width * 0.1], [offset, 0, 0], rim);
-    spoke.geometry.rotateX((s / spokes) * Math.PI);
-    parts.push(spoke);
-  }
-  return parts;
-};
-
-/** A wooden cart wheel: a broad felloe, a thick hub and six real spokes. */
-const cartWheel = (radius: number, offset: number): Part[] => {
-  const parts: Part[] = [];
-  const felloe = new TorusGeometry(radius - 0.05, 0.05, 5, 18);
-  felloe.rotateY(Math.PI / 2);
-  felloe.translate(offset, 0, 0);
-  parts.push({ geometry: felloe, color: '#6b5339' });
-  parts.push(tube([0.1, 0.1], 0.2, [offset, 0, 0], '#4e3d2b', [0, 0, Math.PI / 2], 10));
-  for (let s = 0; s < 6; s += 1) {
-    const spoke = box([0.055, (radius - 0.06) * 2, 0.055], [offset, 0, 0], '#755c40');
-    spoke.geometry.rotateX((s / 6) * Math.PI);
-    parts.push(spoke);
-  }
-  return parts;
-};
-
-type Outfit = {
-  shirt: string;
-  trousers: string;
-  skin: string;
-  /** Mũ bảo hiểm, nón lá, a cloth cap, or bare-headed. */
-  hat: 'helmet' | 'non-la' | 'cap' | 'none';
-  helmet: string;
-};
-
-const SKIN = ['#b88f68', '#c49a72', '#a87f5c'];
-const SHIRTS = ['#4c5f72', '#8a4238', '#d8d3c4', '#3f6049', '#6f5a7d', '#2f4858'];
-const TROUSERS = ['#2f3440', '#4a4237', '#36414a', '#5c5247'];
-const HELMETS = ['#d9d4c6', '#2d3136', '#b03a2e', '#2f6b82'];
-
-const pick = <T>(list: T[], random: () => number): T => list[Math.floor(random() * list.length)];
-
-const dress = (random: () => number, hat: Outfit['hat']): Outfit => ({
-  shirt: pick(SHIRTS, random),
-  trousers: pick(TROUSERS, random),
-  skin: pick(SKIN, random),
-  hat,
-  helmet: pick(HELMETS, random),
-});
-
-/**
- * A seated figure, built as one merged mesh. Nobody gets close enough to a
- * passing bike for an articulated spine to matter, and the lean that actually
- * sells it belongs to the machine the figure is sitting on. Arms reach `hands`
- * and legs reach `feet`, so the same function rigs a rider to handlebars, a
- * cyclo driver to his pedals and a carter to his reins.
- */
-const seatedRider = (
-  hip: [number, number, number],
-  hands: [number, number, number],
-  feet: [number, number, number],
-  outfit: Outfit,
-  lean: number,
-  spread: { grip: number; foot: number }
-): Part[] => {
-  const parts: Part[] = [];
-  const shoulderY = hip[1] + 0.5;
-  const shoulderZ = hip[2] + Math.sin(lean) * 0.46;
-
-  parts.push(box([0.34, 0.2, 0.3], hip, outfit.trousers));
-  parts.push(
-    box([0.36, 0.56, 0.24], [hip[0], (hip[1] + shoulderY) / 2 + 0.05, (hip[2] + shoulderZ) / 2], outfit.shirt, [
-      -lean,
-      0,
-      0,
-    ])
-  );
-  parts.push(box([0.42, 0.15, 0.23], [hip[0], shoulderY, shoulderZ], outfit.shirt, [-lean, 0, 0]));
-  parts.push(tube([0.055, 0.062], 0.09, [hip[0], shoulderY + 0.1, shoulderZ + 0.02], outfit.skin, undefined, 6));
-
-  const headY = shoulderY + 0.24;
-  const headZ = shoulderZ + 0.04;
-  const head = new SphereGeometry(0.1, 9, 7);
-  head.scale(1, 1.14, 1.04);
-  head.translate(hip[0], headY, headZ);
-  parts.push({ geometry: head, color: outfit.skin });
-
-  if (outfit.hat === 'helmet') {
-    const shell = new SphereGeometry(0.135, 11, 8, 0, Math.PI * 2, 0, Math.PI * 0.62);
-    shell.translate(hip[0], headY + 0.015, headZ);
-    parts.push({ geometry: shell, color: outfit.helmet });
-    // The peak and the dark visor band are what make a helmet read as a helmet
-    // from behind, which is the angle anyone following a bike actually has.
-    parts.push(box([0.2, 0.03, 0.1], [hip[0], headY + 0.04, headZ + 0.13], outfit.helmet, [0.2, 0, 0]));
-    parts.push(box([0.21, 0.07, 0.03], [hip[0], headY - 0.01, headZ + 0.11], '#2a3036'));
-  } else if (outfit.hat === 'non-la') {
-    const cone = new ConeGeometry(0.29, 0.16, 14);
-    cone.translate(hip[0], headY + 0.12, headZ);
-    parts.push({ geometry: cone, color: '#d9c48c' });
-  } else if (outfit.hat === 'cap') {
-    parts.push(box([0.21, 0.07, 0.21], [hip[0], headY + 0.1, headZ], outfit.helmet));
-    parts.push(box([0.19, 0.02, 0.1], [hip[0], headY + 0.08, headZ + 0.14], outfit.helmet));
-  }
-
-  for (const side of [-1, 1]) {
-    const shoulder: [number, number, number] = [hip[0] + side * 0.2, shoulderY - 0.02, shoulderZ];
-    const grip: [number, number, number] = [hands[0] + side * spread.grip, hands[1], hands[2]];
-    const elbow: [number, number, number] = [
-      (shoulder[0] + grip[0]) / 2 + side * 0.07,
-      (shoulder[1] + grip[1]) / 2 - 0.08,
-      (shoulder[2] + grip[2]) / 2 - 0.02,
-    ];
-    parts.push(strut(shoulder, elbow, 0.048, outfit.shirt, 5), strut(elbow, grip, 0.042, outfit.skin, 5));
-
-    const hipAt: [number, number, number] = [hip[0] + side * 0.12, hip[1] - 0.04, hip[2]];
-    const foot: [number, number, number] = [feet[0] + side * spread.foot, feet[1], feet[2]];
-    const knee: [number, number, number] = [
-      (hipAt[0] + foot[0]) / 2 + side * 0.04,
-      (hipAt[1] + foot[1]) / 2 + 0.07,
-      (hipAt[2] + foot[2]) / 2 + 0.16,
-    ];
-    parts.push(strut(hipAt, knee, 0.064, outfit.trousers, 5), strut(knee, foot, 0.053, outfit.trousers, 5));
-    parts.push(box([0.09, 0.05, 0.22], [foot[0], foot[1] - 0.01, foot[2] + 0.04], '#2b2b2e'));
-  }
-
-  return parts;
-};
-
-// --- xe máy -------------------------------------------------------------------
-
-const motorbikeBuild = (paint: string, cargo: boolean, random: () => number, solo = false): Build => {
-  const build = emptyBuild();
-  const spec = SPECS.motorbike;
-  const dark = '#2a2d31';
-  const chrome = '#b9bdc0';
-
-  build.body.push(
-    box([0.3, 0.26, 0.42], [0, 0.34, -0.04], dark),
-    tube([0.07, 0.075], 0.22, [0, 0.47, 0.11], '#8d9296', [1.15, 0, 0], 8),
-    box([0.12, 0.09, 0.66], [0, 0.68, -0.32], dark),
-    box([0.24, 0.17, 0.34], [0, 0.63, -0.2], paint),
-    box([0.3, 0.22, 0.46], [0, 0.46, -0.16], paint),
-    box([0.34, 0.4, 0.1], [0, 0.6, 0.4], paint),
-    box([0.26, 0.04, 0.38], [0, 0.24, 0.13], dark),
-    box([0.27, 0.1, 0.62], [0, 0.76, -0.22], '#23242a'),
-    box([0.2, 0.08, 0.17], [0, 0.755, 0.11], '#23242a'),
-    box([0.26, 0.03, 0.27], [0, 0.805, -0.56], chrome),
-    box([0.16, 0.11, 0.015], [0, 0.44, -0.79], '#e6e3d8'),
-    box([0.17, 0.04, 0.3], [0, 0.49, -0.64], dark)
-  );
-
-  // A step-through has no top tube, so the line from the steering head down to
-  // the engine is most of what there is to recognise it by.
-  build.body.push(
-    strut([0, 0.86, 0.5], [0, 0.44, 0.1], 0.032, dark, 6),
-    strut([0, 0.86, 0.5], [0, 0.69, -0.02], 0.028, dark, 6),
-    strut([RIGHT * 0.09, 0.33, -0.1], [RIGHT * 0.15, 0.25, -0.46], 0.028, chrome, 6),
-    tube([0.05, 0.045], 0.34, [RIGHT * 0.16, 0.26, -0.66], chrome, [Math.PI / 2, 0, 0], 8)
-  );
-  for (const side of [-1, 1]) {
-    build.body.push(
-      strut([side * 0.095, 0.34, -0.1], [side * 0.08, 0.215, -0.6], 0.022, dark, 5),
-      strut([side * 0.09, 0.64, -0.28], [side * 0.085, 0.3, -0.58], 0.026, '#6f757a', 6),
-      box([0.11, 0.035, 0.09], [side * 0.17, 0.26, -0.02], dark)
-    );
-  }
-
-  build.rearWheel.push(...wheel(spec.wheelRadius, 0.1, 0, 7));
-  build.frontWheel.push(...wheel(spec.wheelRadius, 0.09, 0, 7));
-
-  // Steering assembly, in vehicle coordinates — the assembler rebases it.
-  const axle = spec.frontAxle;
-  const bars = axle - 0.14;
-  build.steer.push(
-    box([0.17, 0.07, 0.11], [0, 0.75, axle + 0.02], dark),
-    box([0.14, 0.06, 0.4], [0, 0.4, axle + 0.02], paint),
-    box([0.2, 0.18, 0.13], [0, 0.86, axle + 0.01], dark),
-    tube([0.017, 0.017], 0.62, [0, 0.9, bars], '#6f757a', [0, 0, Math.PI / 2], 6),
-    box([0.14, 0.07, 0.1], [0, 0.99, bars - 0.05], dark)
-  );
-  for (const side of [-1, 1]) {
-    build.steer.push(
-      strut([side * 0.075, 0.72, axle + 0.04], [side * 0.075, 0.215, axle], 0.024, chrome, 6),
-      tube([0.023, 0.023], 0.11, [side * 0.26, 0.9, bars], '#1f2024', [0, 0, Math.PI / 2], 6),
-      strut([side * 0.21, 0.92, bars], [side * 0.27, 1.1, bars - 0.01], 0.012, '#6f757a', 4),
-      box([0.12, 0.07, 0.02], [side * 0.27, 1.13, bars - 0.01], '#cfd4d6', [0, 0, side * 0.2]),
-      box([0.11, 0.05, 0.03], [side * 0.14, 0.75, axle + 0.09], '#e2a43c')
-    );
-  }
-  build.head.push(box([0.16, 0.12, 0.03], [0, 0.86, axle + 0.09], '#ffffff'));
-  build.tail.push(box([0.11, 0.06, 0.025], [0, 0.56, -0.79], '#ffffff'));
-  build.lamp = [0, 0.86, axle + 0.12];
-
-  build.rider.push(
-    ...seatedRider(
-      [0, 0.86, -0.18],
-      [0, 0.9, 0.48],
-      [0, 0.29, -0.02],
-      dress(random, random() < 0.78 ? 'helmet' : 'non-la'),
-      0.26,
-      {
-        grip: 0.26,
-        foot: 0.17,
-      }
-    )
-  );
-
-  if (!cargo && !solo && random() < 0.55) {
-    // Two up is the normal way to carry a second person here, and the pillion
-    // sits square where the rider is folded forward over the bars. Never on one
-    // the player can take: a passenger who appears the moment you sit down is a
-    // ghost, and the figure on a parked bike is the one you become.
-    build.rider.push(
-      ...seatedRider(
-        [0, 0.88, -0.56],
-        [0, 0.78, -0.3],
-        [0, 0.3, -0.42],
-        dress(random, random() < 0.6 ? 'helmet' : 'none'),
-        0.08,
-        { grip: 0.16, foot: 0.19 }
-      )
-    );
-  }
-
-  if (cargo) {
-    // Loaded past any sensible limit, which is the point of the variant: crates
-    // up the back, panniers either side, cord criss-crossed over the lot.
-    const crates = 2 + Math.floor(random() * 2);
-    let stack = 0.82;
-    for (let c = 0; c < crates; c += 1) {
-      const tall = 0.2 + random() * 0.08;
-      build.body.push(
-        box(
-          [0.52 - c * 0.06, tall, 0.42 - c * 0.04],
-          [0, stack + tall / 2, -0.56],
-          c % 2 === 0 ? '#9a7b4f' : '#7c6a52',
-          [0, (random() - 0.5) * 0.14, 0]
-        )
-      );
-      stack += tall;
-    }
-    for (const side of [-1, 1]) {
-      build.body.push(
-        tube([0.2, 0.15], 0.34, [side * 0.34, 0.56, -0.5], '#b39a6e', undefined, 12),
-        tube([0.21, 0.21], 0.03, [side * 0.34, 0.73, -0.5], '#8d7a55', undefined, 12)
-      );
-    }
-    build.body.push(
-      strut([-0.3, 0.76, -0.56], [0.3, stack - 0.04, -0.56], 0.012, '#4a4335', 4),
-      strut([0.3, 0.76, -0.56], [-0.3, stack - 0.04, -0.56], 0.012, '#4a4335', 4)
-    );
-  }
-
-  return build;
-};
-
-// --- xe con -------------------------------------------------------------------
-
-const carBuild = (paint: string, random: () => number): Build => {
-  const build = emptyBuild();
-  const spec = SPECS.car;
-  const dark = '#23262a';
-  const chrome = '#b4b9bc';
-  const half = spec.width / 2;
-  const axles = [spec.frontAxle, spec.rearAxle];
-
-  const stations: number[] = [];
-  for (let i = 0; i <= 26; i += 1) stations.push(-2.15 + (i / 26) * 4.3);
-
-  build.body.push(
-    loft(
-      stations,
-      (z) => {
-        const t = (z + 2.15) / 4.3;
-        const beam = half * (0.82 + 0.18 * Math.sin(Math.PI * t) ** 0.45);
-        const end = Math.max(0, Math.abs(2 * t - 1) - 0.84) / 0.16;
-        // Clears a 0.31 m wheel over each axle and drops to a sill between them.
-        const floor = 0.26 + 0.42 * archLift(z, axles, 0.56) + end * 0.1;
-        return slab(beam, floor, 1.0 - end * 0.11, 0.94);
-      },
-      paint
-    ),
-    loft([-1.86, 1.86], () => slab(0.6, 0.17, 0.42, 1), '#2b2f33')
-  );
-
-  // The greenhouse: glass all round, raked at both ends so the screens come out
-  // of the sweep rather than being pasted on as flat plates.
-  const cabin = [-0.82, -0.56, -0.1, 0.44, 0.78, 1.0];
-  const cabinRoof = [1.12, 1.33, 1.44, 1.44, 1.26, 1.06];
-  const cabinHalf = [0.68, 0.74, 0.77, 0.75, 0.69, 0.58];
-  build.glass.push(loft(cabin, (_z, index) => slab(cabinHalf[index], 1.0, cabinRoof[index], 0.9), '#10181d'));
-  build.body.push(loft([-0.52, 0.46], () => slab(0.78, 1.41, 1.48, 0.95), paint));
-
-  for (const side of [-1, 1]) {
-    build.body.push(
-      strut([side * 0.66, 1.0, 0.88], [side * 0.72, 1.44, 0.44], 0.045, paint, 5),
-      strut([side * 0.76, 1.0, 0.06], [side * 0.78, 1.44, 0.06], 0.038, dark, 5),
-      strut([side * 0.68, 1.0, -0.78], [side * 0.74, 1.44, -0.36], 0.05, paint, 5),
-      strut([side * 0.74, 1.44, -0.4], [side * 0.74, 1.44, 0.46], 0.035, paint, 5),
-      box([0.07, 0.09, 2.5], [side * (half - 0.04), 0.3, 0], '#2f3338'),
-      box([0.13, 0.04, 0.035], [side * (half - 0.02), 0.92, 0.42], chrome),
-      box([0.13, 0.04, 0.035], [side * (half - 0.02), 0.92, -0.36], chrome),
-      strut([side * 0.8, 1.06, 0.74], [side * 0.97, 1.09, 0.7], 0.022, paint, 5),
-      box([0.08, 0.12, 0.2], [side * 1.0, 1.1, 0.68], dark),
-      box([0.02, 0.1, 0.17], [side * 1.03, 1.1, 0.68], '#9fb0b8')
-    );
-
-    for (const axle of axles) {
-      const arch = new TorusGeometry(0.42, 0.05, 4, 10, Math.PI);
-      arch.rotateY(Math.PI / 2);
-      arch.translate(side * (half - 0.03), spec.wheelRadius, axle);
-      build.body.push({ geometry: arch, color: paint });
-    }
-  }
-
-  build.body.push(
-    box([1.74, 0.24, 0.16], [0, 0.5, 2.11], '#44484c'),
-    box([1.74, 0.24, 0.16], [0, 0.5, -2.11], '#44484c'),
-    box([1.12, 0.22, 0.07], [0, 0.8, 2.13], dark),
-    box([1.0, 0.035, 0.04], [0, 0.86, 2.16], chrome),
-    box([1.0, 0.035, 0.04], [0, 0.79, 2.16], chrome),
-    box([0.44, 0.13, 0.02], [0, 0.6, 2.17], '#e8e5da'),
-    box([0.44, 0.13, 0.02], [0, 0.66, -2.17], '#e8e5da'),
-    tube([0.035, 0.038], 0.12, [RIGHT * 0.52, 0.32, -2.12], '#7c8184', [Math.PI / 2, 0, 0], 8)
-  );
-  if (random() < 0.35) {
-    // Half the cars on a Vietnamese road are carrying something on the roof.
-    for (const side of [-1, 1]) build.body.push(box([0.05, 0.05, 1.0], [side * 0.6, 1.53, 0], '#55595d'));
-    build.body.push(
-      box([1.3, 0.05, 0.06], [0, 1.53, 0.44], '#55595d'),
-      box([1.3, 0.05, 0.06], [0, 1.53, -0.44], '#55595d')
-    );
-  }
-
-  for (const side of [-1, 1]) {
-    build.head.push(box([0.36, 0.15, 0.06], [side * 0.58, 0.88, 2.12], '#ffffff'));
-    build.body.push(box([0.14, 0.09, 0.05], [side * 0.8, 0.84, 2.12], '#e2a43c'));
-    build.tail.push(box([0.28, 0.17, 0.05], [side * 0.62, 0.94, -2.12], '#ffffff'));
-  }
-  build.lamp = [0, 0.88, 2.2];
-
-  build.frontWheel.push(...wheel(spec.wheelRadius, 0.21, -0.78, 6), ...wheel(spec.wheelRadius, 0.21, 0.78, 6));
-  build.rearWheel.push(...wheel(spec.wheelRadius, 0.21, -0.78, 6), ...wheel(spec.wheelRadius, 0.21, 0.78, 6));
-  return build;
-};
-
-// --- xe tải -------------------------------------------------------------------
-
-const truckBuild = (paint: string, random: () => number): Build => {
-  const build = emptyBuild();
-  const spec = SPECS.truck;
-  const dark = '#262a2e';
-  const half = spec.width / 2;
-
-  build.body.push(
-    box([1.36, 0.18, 4.9], [0, 0.56, 0.1], '#3b3f43'),
-    loft([1.02, 1.3, 2.3, 2.62], (z) => slab(half * (z > 2.4 ? 0.93 : 1), 0.7, z > 2.4 ? 1.86 : 2.2, 0.96), paint),
-    box([half * 2, 0.5, 3.5], [0, 1.0, -0.78], paint),
-    box([half * 1.96, 0.1, 3.5], [0, 1.26, -0.78], '#7b6246')
-  );
-
-  build.glass.push(
-    box([half * 1.84, 0.78, 0.07], [0, 1.78, 2.56], '#10181d', [-0.13, 0, 0]),
-    box([0.06, 0.6, 0.9], [-(half - 0.03), 1.66, 1.78], '#10181d'),
-    box([0.06, 0.6, 0.9], [half - 0.03, 1.66, 1.78], '#10181d')
-  );
-
-  // Dropside boards with real corner stakes, which is what every small truck
-  // here has and what a plain box body never looks like.
-  for (const side of [-1, 1]) {
-    build.body.push(
-      box([0.08, 0.5, 3.5], [side * (half - 0.05), 1.56, -0.78], '#8a6f4e'),
-      box([0.09, 0.56, 0.09], [side * (half - 0.05), 1.59, 0.9], '#5d4a35'),
-      box([0.09, 0.56, 0.09], [side * (half - 0.05), 1.59, -2.46], '#5d4a35'),
-      strut([side * (half + 0.02), 1.72, 2.44], [side * (half + 0.3), 1.72, 2.4], 0.025, dark, 5),
-      box([0.08, 0.26, 0.17], [side * (half + 0.36), 1.68, 2.38], dark),
-      box([0.02, 0.22, 0.14], [side * (half + 0.4), 1.68, 2.38], '#9fb0b8'),
-      box([0.05, 0.42, 0.2], [side * (half - 0.04), 0.3, -1.68], '#1f2124')
-    );
-  }
-  build.body.push(
-    box([half * 1.9, 0.5, 0.08], [0, 1.56, -2.5], '#8a6f4e'),
-    box([half * 2.02, 0.26, 0.18], [0, 0.48, 2.64], '#4a4e52'),
-    box([1.2, 0.3, 0.08], [0, 0.95, 2.66], dark),
-    box([0.46, 0.14, 0.02], [0, 0.62, 2.7], '#e8e5da')
-  );
-
-  // Sacks of rice, roped down. Stacked in two courses so the load has a shape.
-  const sacks = 4 + Math.floor(random() * 4);
-  for (let s = 0; s < sacks; s += 1) {
-    const sack = new SphereGeometry(0.3, 8, 6);
-    sack.scale(1.1, 0.74, 1.3);
-    sack.rotateY(random() * Math.PI);
-    sack.translate((random() - 0.5) * 1.1, 1.52 + Math.floor(s / 4) * 0.4, -0.3 - (s % 4) * 0.62);
-    build.body.push({ geometry: sack, color: s % 3 === 0 ? '#cdc3a4' : '#b8ad8c' });
-  }
-  for (const side of [-1, 1]) {
-    build.body.push(
-      strut([side * (half - 0.06), 1.58, 0.7], [side * (half - 0.06) * 0.2, 2.0, -0.8], 0.014, '#4a4335', 4)
-    );
-  }
-
-  for (const side of [-1, 1]) {
-    build.head.push(box([0.3, 0.16, 0.06], [side * 0.62, 0.92, 2.68], '#ffffff'));
-    build.tail.push(box([0.22, 0.2, 0.05], [side * 0.68, 0.78, -2.58], '#ffffff'));
-  }
-  build.lamp = [0, 0.92, 2.74];
-
-  build.frontWheel.push(...wheel(spec.wheelRadius, 0.22, -0.8, 6), ...wheel(spec.wheelRadius, 0.22, 0.8, 6));
-  // Twin rears, the giveaway that it is a load-carrier and not just a big car.
-  for (const side of [-1, 1]) {
-    build.rearWheel.push(
-      ...wheel(spec.wheelRadius, 0.2, side * 0.66, 6),
-      ...wheel(spec.wheelRadius, 0.2, side * 0.88, 6)
-    );
-  }
-  return build;
-};
-
-// --- xe khách -----------------------------------------------------------------
-
-const coachBuild = (paint: string, trim: string): Build => {
-  const build = emptyBuild();
-  const spec = SPECS.coach;
-  const half = spec.width / 2;
-  const dark = '#23262a';
-  const axles = [spec.frontAxle, spec.rearAxle];
-
-  const stations: number[] = [];
-  for (let i = 0; i <= 28; i += 1) stations.push(-5.25 + (i / 28) * 10.5);
-
-  build.body.push(
-    loft(
-      stations,
-      (z) => {
-        const t = (z + 5.25) / 10.5;
-        const end = Math.max(0, Math.abs(2 * t - 1) - 0.9) / 0.1;
-        const floor = 0.5 + 0.66 * archLift(z, axles, 0.9) + end * 0.14;
-        return slab(half * (1 - end * 0.09), floor, 3.34 - end * 0.22, 0.93);
-      },
-      paint
-    ),
-    box([half * 2.02, 0.42, 9.6], [0, 1.6, -0.3], trim),
-    box([half * 2.04, 0.14, 10.2], [0, 1.1, -0.2], trim)
-  );
-
-  build.glass.push(
-    loft([-4.6, 4.3], () => slab(half - 0.04, 1.9, 2.82, 0.96), '#121b20'),
-    box([half * 1.82, 1.12, 0.1], [0, 2.3, 5.14], '#121b20', [-0.1, 0, 0]),
-    box([half * 1.8, 0.95, 0.09], [0, 2.26, -5.14], '#121b20', [0.08, 0, 0])
-  );
-  for (let p = -4; p <= 4; p += 1) {
-    build.body.push(box([half * 2.06, 0.95, 0.09], [0, 2.36, p * 1.06], paint));
-  }
-
-  build.body.push(
-    box([1.7, 0.3, 0.06], [0, 3.02, 5.1], dark),
-    box([1.5, 0.19, 0.03], [0, 3.02, 5.14], '#d9cf9a'),
-    box([half * 1.9, 0.1, 9.0], [0, 3.4, -0.3], trim),
-    box([0.9, 0.72, 0.07], [RIGHT * (half - 0.01), 1.3, 2.0], dark),
-    box([0.9, 0.72, 0.07], [RIGHT * (half - 0.01), 1.3, -1.6], dark),
-    box([half * 2.02, 0.3, 0.2], [0, 0.72, 5.2], '#4a4e52'),
-    box([half * 2.02, 0.3, 0.2], [0, 0.72, -5.2], '#4a4e52'),
-    box([0.48, 0.14, 0.02], [0, 0.84, 5.28], '#e8e5da'),
-    box([0.1, 1.8, 0.95], [RIGHT * (half - 0.02), 1.6, 3.6], dark)
-  );
-  build.glass.push(box([0.06, 1.1, 0.8], [RIGHT * (half - 0.06), 2.0, 3.6], '#121b20'));
-
-  for (const side of [-1, 1]) {
-    build.head.push(
-      box([0.3, 0.17, 0.06], [side * 0.86, 1.08, 5.24], '#ffffff'),
-      box([0.2, 0.13, 0.05], [side * 1.06, 0.86, 5.24], '#ffffff')
-    );
-    build.tail.push(
-      box([0.24, 0.2, 0.05], [side * 0.88, 1.1, -5.24], '#ffffff'),
-      box([0.18, 0.14, 0.05], [side * 1.04, 0.86, -5.24], '#ffffff')
-    );
-    // Roof marker lamps: how you see one of these coming round a bend at night.
-    for (let m = -1; m <= 1; m += 1) build.tail.push(box([0.1, 0.06, 0.1], [side * 1.0, 3.3, m * 2.4], '#ffffff'));
-    build.body.push(
-      strut([side * (half + 0.02), 2.6, 4.95], [side * (half + 0.34), 2.6, 4.88], 0.028, dark, 5),
-      box([0.09, 0.32, 0.2], [side * (half + 0.42), 2.54, 4.86], dark)
-    );
-  }
-  build.lamp = [0, 1.08, 5.32];
-
-  build.frontWheel.push(...wheel(spec.wheelRadius, 0.26, -1.06, 8), ...wheel(spec.wheelRadius, 0.26, 1.06, 8));
-  for (const side of [-1, 1]) {
-    build.rearWheel.push(
-      ...wheel(spec.wheelRadius, 0.24, side * 0.9, 8),
-      ...wheel(spec.wheelRadius, 0.24, side * 1.16, 8)
-    );
-  }
-
-  // Left-hand drive, because the traffic keeps right.
-  build.rider.push(
-    ...seatedRider(
-      [-RIGHT * 0.72, 1.72, 4.1],
-      [-RIGHT * 0.72, 1.84, 4.52],
-      [-RIGHT * 0.72, 1.24, 4.6],
-      { shirt: '#d8d3c4', trousers: '#2f3440', skin: SKIN[0], hat: 'cap', helmet: '#2d3136' },
-      0.1,
-      { grip: 0.2, foot: 0.14 }
-    )
-  );
-  return build;
-};
-
-// --- xe đạp -------------------------------------------------------------------
-
-const bicycleBuild = (paint: string, random: () => number): Build => {
-  const build = emptyBuild();
-  const spec = SPECS.bicycle;
-  const r = spec.wheelRadius;
-  const axle = spec.frontAxle;
-  const bb: [number, number, number] = [0, 0.29, -0.06];
-  const seatTop: [number, number, number] = [0, 0.96, -0.28];
-  const headTop: [number, number, number] = [0, 0.96, axle - 0.08];
-
-  build.body.push(
-    strut(bb, seatTop, 0.019, paint, 5),
-    strut(bb, headTop, 0.021, paint, 5),
-    strut(seatTop, headTop, 0.018, paint, 5),
-    strut(bb, [0, r, spec.rearAxle], 0.015, paint, 5),
-    strut(seatTop, [0, r, spec.rearAxle], 0.013, paint, 5),
-    box([0.17, 0.05, 0.26], [0, 0.99, -0.3], '#2a2b2e'),
-    tube([0.095, 0.095], 0.012, [0, 0.29, -0.02], '#9fa4a7', [0, 0, Math.PI / 2], 16),
-    box([0.1, 0.04, 0.06], [0, 0.76, -0.42], '#9fa4a7'),
-    tube([0.16, 0.13], 0.22, [0, 0.76, axle + 0.08], '#b39a6e', undefined, 12),
-    tube([0.165, 0.165], 0.022, [0, 0.87, axle + 0.08], '#8d7a55', undefined, 12)
-  );
-  if (random() < 0.6) {
-    const bundle = new SphereGeometry(0.15, 8, 6);
-    bundle.scale(1.1, 0.8, 1);
-    bundle.translate(0, 0.91, axle + 0.08);
-    build.body.push({ geometry: bundle, color: '#5f7a44' });
-  }
-
-  build.steer.push(
-    strut([0, 0.98, axle - 0.08], [0, r, axle], 0.018, paint, 5),
-    tube([0.013, 0.013], 0.5, [0, 1.02, axle - 0.1], '#9fa4a7', [0, 0, Math.PI / 2], 6)
-  );
-  for (const side of [-1, 1]) {
-    build.steer.push(tube([0.019, 0.019], 0.11, [side * 0.2, 1.02, axle - 0.1], '#2a2b2e', [0, 0, Math.PI / 2], 6));
-  }
-
-  build.frontWheel.push(...wheel(r, 0.05, 0, 9, '#c6cbce'));
-  build.rearWheel.push(...wheel(r, 0.05, 0, 9, '#c6cbce'));
-  // No headlight. Half of them have none, and the rear reflector is the only
-  // thing that lights up — which is itself the honest night-time silhouette.
-  build.tail.push(box([0.07, 0.05, 0.02], [0, 0.72, -0.44], '#ffffff'));
-
-  build.rider.push(
-    ...seatedRider(
-      [0, 1.03, -0.3],
-      [0, 1.04, axle - 0.08],
-      [0, 0.34, 0.0],
-      dress(random, random() < 0.5 ? 'non-la' : 'cap'),
-      0.18,
-      {
-        grip: 0.2,
-        foot: 0.15,
-      }
-    )
-  );
-  for (const side of [-1, 1]) {
-    build.swing.push({
-      parts: [
-        box([0.03, 0.17, 0.03], [0, -0.085, 0], '#8e9397'),
-        box([0.075, 0.03, 0.12], [side * 0.05, -0.17, 0], '#2a2b2e'),
-      ],
-      at: [side * 0.08, bb[1], bb[2]],
-      phase: side > 0 ? 0 : Math.PI,
-      gain: 1,
-    });
-  }
-  return build;
-};
-
-// --- xích lô ------------------------------------------------------------------
-
-const cycloBuild = (paint: string, random: () => number): Build => {
-  const build = emptyBuild();
-  const spec = SPECS.cyclo;
-  const r = spec.wheelRadius;
-  const frame = '#4d5a63';
-
-  build.body.push(
-    box([1.1, 0.07, 0.9], [0, 0.42, 0.82], '#6b5842'),
-    box([1.0, 0.5, 0.08], [0, 0.72, 0.42], paint),
-    box([1.02, 0.12, 0.08], [0, 1.0, 0.44], '#3a3024'),
-    box([0.07, 0.4, 0.84], [-0.52, 0.66, 0.82], paint),
-    box([0.07, 0.4, 0.84], [0.52, 0.66, 0.82], paint),
-    box([0.96, 0.05, 0.3], [0, 0.3, 1.28], '#6b5842'),
-    strut([-0.5, 0.38, 0.4], [0, 0.46, -0.5], 0.028, frame, 5),
-    strut([0.5, 0.38, 0.4], [0, 0.46, -0.5], 0.028, frame, 5),
-    strut([-0.52, r, 0.95], [0.52, r, 0.95], 0.022, frame, 5),
-    strut([0, 0.46, -0.5], [0, 0.3, -1.02], 0.024, frame, 5),
-    strut([0, 1.04, -0.56], [0, 0.34, -0.3], 0.02, frame, 5),
-    box([0.16, 0.05, 0.24], [0, 1.08, -0.58], '#2a2b2e'),
-    tube([0.014, 0.014], 0.44, [0, 1.12, -0.18], '#9fa4a7', [0, 0, Math.PI / 2], 6),
-    tube([0.09, 0.09], 0.01, [0, 0.34, -0.3], '#9fa4a7', [0, 0, Math.PI / 2], 14)
-  );
-
-  // The folding hood over the passenger, which is what a xích lô is known by.
-  for (let rib = 0; rib < 3; rib += 1) {
-    const hood = new TorusGeometry(0.56, 0.028, 4, 10, Math.PI);
-    hood.rotateY(Math.PI / 2);
-    hood.translate(0, 0.98, 1.0 + rib * 0.24);
-    build.body.push({ geometry: hood, color: frame });
-  }
-  build.body.push(
-    loft(
-      [0.98, 1.22, 1.5],
-      () => [
-        [-0.58, 0.98],
-        [-0.42, 1.44],
-        [0.42, 1.44],
-        [0.58, 0.98],
-      ],
-      '#2f4858'
-    )
-  );
-
-  build.frontWheel.push(...wheel(r, 0.05, -0.52, 9, '#c6cbce'), ...wheel(r, 0.05, 0.52, 9, '#c6cbce'));
-  build.rearWheel.push(...wheel(r + 0.01, 0.05, 0, 9, '#c6cbce'));
-  build.tail.push(box([0.07, 0.05, 0.02], [0, 0.4, -1.16], '#ffffff'));
-
-  build.rider.push(
-    ...seatedRider([0, 1.12, -0.54], [0, 1.12, -0.2], [0, 0.46, -0.3], dress(random, 'non-la'), 0.2, {
-      grip: 0.18,
-      foot: 0.14,
-    })
-  );
-  if (random() < 0.7) {
-    build.rider.push(
-      ...seatedRider([0, 0.62, 0.74], [0, 0.66, 1.0], [0, 0.34, 1.24], dress(random, 'none'), -0.05, {
-        grip: 0.22,
-        foot: 0.17,
-      })
-    );
-  }
-  for (const side of [-1, 1]) {
-    build.swing.push({
-      parts: [
-        box([0.03, 0.16, 0.03], [0, -0.08, 0], '#8e9397'),
-        box([0.07, 0.03, 0.11], [side * 0.05, -0.16, 0], '#2a2b2e'),
-      ],
-      at: [side * 0.08, 0.34, -0.3],
-      phase: side > 0 ? 0 : Math.PI,
-      gain: 1,
-    });
-  }
-  return build;
-};
-
-// --- xe trâu ------------------------------------------------------------------
-
-const buffaloCartBuild = (random: () => number): Build => {
-  const build = emptyBuild();
-  const spec = SPECS['buffalo-cart'];
-  const wood = '#7b6246';
-  const hide = '#4a4540';
-
-  build.body.push(
-    box([1.34, 0.1, 2.1], [0, 0.78, -0.3], wood),
-    box([1.4, 0.12, 0.14], [0, 0.72, -1.28], '#5d4a35'),
-    box([1.4, 0.12, 0.14], [0, 0.72, 0.66], '#5d4a35'),
-    box([0.12, 0.44, 2.1], [-0.65, 1.04, -0.3], '#8a6f4e'),
-    box([0.12, 0.44, 2.1], [0.65, 1.04, -0.3], '#8a6f4e'),
-    box([1.34, 0.44, 0.1], [0, 1.04, -1.33], '#8a6f4e'),
-    box([0.16, 0.16, 0.5], [0, 0.72, -0.3], '#5d4a35'),
-    strut([-0.5, 0.74, 0.6], [-0.42, 0.92, 2.42], 0.045, wood, 6),
-    strut([0.5, 0.74, 0.6], [0.42, 0.92, 2.42], 0.045, wood, 6),
-    box([1.16, 0.1, 0.12], [0, 0.95, 2.44], '#5d4a35')
-  );
-
-  for (const side of [-1, 1]) build.rearWheel.push(...cartWheel(spec.wheelRadius, side * 0.78));
-
-  const bales = 3 + Math.floor(random() * 3);
-  for (let b = 0; b < bales; b += 1) {
-    build.body.push(
-      tube(
-        [0.26, 0.26],
-        1.1,
-        [(random() - 0.5) * 0.5, 1.12 + Math.floor(b / 2) * 0.46, -0.3 - (b % 2) * 0.6],
-        '#c9b574',
-        [0, (random() - 0.5) * 0.2, Math.PI / 2],
-        9
-      )
-    );
-  }
-
-  // --- con trâu -------------------------------------------------------------
-  const barrel = new SphereGeometry(0.52, 12, 9);
-  barrel.scale(0.92, 0.9, 1.5);
-  barrel.translate(0, 1.0, 3.5);
-  build.body.push({ geometry: barrel, color: hide });
-  build.body.push(
-    box([0.78, 0.5, 0.5], [0, 1.26, 3.0], hide),
-    strut([0, 1.1, 4.3], [0, 0.92, 4.86], 0.2, hide, 7),
-    box([0.3, 0.24, 0.26], [0, 0.86, 5.0], '#3a3631'),
-    box([0.2, 0.08, 0.1], [0, 0.78, 5.12], '#262320'),
-    strut([0, 1.18, 2.98], [0, 1.02, 2.3], 0.035, hide, 5),
-    box([1.1, 0.1, 0.14], [0, 1.44, 3.3], '#6b5339')
-  );
-  for (const side of [-1, 1]) {
-    const horn = new TorusGeometry(0.26, 0.035, 4, 9, Math.PI * 0.8);
-    horn.rotateX(Math.PI / 2);
-    horn.rotateZ(side * 0.5);
-    horn.translate(side * 0.16, 1.1, 4.82);
-    build.body.push(
-      { geometry: horn, color: '#b8ae96' },
-      box([0.1, 0.18, 0.06], [side * 0.26, 1.0, 4.76], hide),
-      strut([side * 0.44, 1.44, 3.3], [side * 0.42, 0.98, 2.5], 0.022, '#4a4335', 4)
-    );
-  }
-
-  for (const side of [-1, 1]) {
-    for (const along of [3.02, 4.0]) {
-      build.swing.push({
-        parts: [strut([0, 0, 0], [0, -0.78, 0.04], 0.07, hide, 6), box([0.14, 0.09, 0.2], [0, -0.82, 0.08], '#2b2823')],
-        at: [side * 0.3, 0.98, along],
-        phase: (side > 0 ? 0 : Math.PI) + (along > 3.5 ? Math.PI : 0),
-        gain: 0.26,
-      });
-    }
-  }
-
-  build.rider.push(
-    ...seatedRider(
-      [-RIGHT * 0.3, 0.98, 0.4],
-      [-RIGHT * 0.3, 1.04, 0.86],
-      [-RIGHT * 0.3, 0.5, 0.78],
-      { shirt: '#8a7f66', trousers: '#4a4237', skin: SKIN[2], hat: 'non-la', helmet: '#3b4149' },
-      0.12,
-      { grip: 0.18, foot: 0.15 }
-    )
-  );
-  return build;
-};
-
-// --- the module ---------------------------------------------------------------
-
-type Swing = { node: Object3D; phase: number; gain: number };
-
-type Rig = {
-  group: Group;
-  rearAxle: Object3D;
-  frontAxle: Object3D;
-  steer: Object3D | null;
-  rider: Object3D | null;
-  swings: Swing[];
-  tail: Mesh | null;
-  glow: Mesh | null;
-};
-
 type Agent = Rig & {
   spec: Spec;
   road: number;
@@ -1219,43 +137,117 @@ export type Vehicles = {
    * rider who took one out of it would be fighting the car behind for the lane.
    */
   rideables: () => Rideable[];
+  /**
+   * The shared materials and the assembler, so a companion's machine comes out
+   * of the same pair of shaders as the bus in front of it. Owned here: it is
+   * disposed with the fleet, and a rig borrowed from it dies at the same moment.
+   */
+  kit: VehicleKit;
+  /**
+   * The moving fleet as bodies a driven machine can hit, rewritten in place
+   * every tick. Read fresh each frame and never held — and empty until the
+   * first tick, because before that nothing has been put in a lane.
+   */
+  traffic: () => readonly Impactor[];
+  /**
+   * Hands the fleet a getter for where the player is, so it can brake for them.
+   * Null unhooks it. A setter because the walker is made long after the fleet
+   * and only once somebody goes down to walk the place.
+   */
+  watch: (body: (() => Impactor | null) | null) => void;
   dispose: () => void;
 };
 
-const PAINT = ['#b23a2e', '#2f4858', '#c9c3b4', '#3f6049', '#d9b24c', '#6f5a7d', '#1f2a33', '#a8562e'];
+/** Handed out instead of the pool before the first tick has placed anything. */
+const NONE: readonly Impactor[] = [];
 
-const LAMP_DAY = new Color('#43443e');
-const LAMP_NIGHT = new Color('#fff0c8');
-const TAIL_DAY = new Color('#4a2420');
-const TAIL_NIGHT = new Color('#c4291e');
+/**
+ * What the machine the *player* rides is, where it stops being a Honda Wave.
+ *
+ * Three numbers, and they are not a faster Wave — they are not a machine that
+ * exists. The player has asked three times for the bike to be faster than
+ * running and twice been answered with a top speed, which is the wrong
+ * measurement: a body on foot crosses country in a straight line at a flat
+ * 14 m/s, while a machine follows a carriageway 13% longer, brakes for every
+ * bend, and takes seconds to spool up. Measured off this probe's own sustained
+ * figures and divided by that 1.13, the stock Wave came to 0.98× running at
+ * Tràng An and 1.01× at Tà Xùa. The player was right every time. Asked what they
+ * wanted instead they said "phải nhanh hơn 3x 4x", so this is three to four
+ * times a running body and is written down as a fiction rather than dressed up
+ * as a 150 cc.
+ *
+ * `grip` is the one that matters and the one that is easy to get wrong. A
+ * corner bounds the average; the top speed does not. At the stock 5.2 m/s² a
+ * 125 m bend holds 25.5 m/s and a 58 m bend 17.4, so raising the power alone
+ * gives a machine that reaches 198 km/h on a straight, leaves the road at every
+ * bend, and has exactly the same point-to-point average it always had. At
+ * 30 m/s² — `tuneDrive` reads it as `grip / (G · CRUISE_SHARE)`, so 16.5 is
+ * 3.06 g at the tyre — the same two bends hold 61.2 and 41.7.
+ *
+ * It is applied **here**, where the ridden `DriveSpec` is assembled, and not in
+ * `SPECS`. `Spec.grip` is also what the fleet's own bend law reads as
+ * `sqrt(spec.grip / bend)`, and that law had never once fired at three of the
+ * four destinations until the roads were made sinuous — hand the traffic 3 g and
+ * it stops braking for corners again and that work is undone.
+ *
+ * The governor, the boost ceiling, the hard cap and the room's own rejection
+ * limit are all raised to match, in `driving-tuning.ts`, `driving.ts`,
+ * `driving-state.ts` and the server's `configuration.ts`. The reasoning for the
+ * figures those four carry lives with them.
+ *
+ * The bodywork is untouched. It is still the step-through `motorbikeBuild`
+ * draws, and it still reads as one.
+ */
+/**
+ * What the one you ride is, as against what the fleet around it is.
+ *
+ * The player asked to be three to four times quicker than running, which on
+ * these roads is 198 km/h, and that is no longer a 110 cc step-through whatever
+ * the bodywork still draws. These are the four numbers that follow from saying
+ * so, and they are overridden here rather than in `SPECS` because the NPC fleet
+ * reads that table — its bend law takes `grip`, and a traffic jam with a 3 g
+ * tyre limit stops braking for corners at all.
+ *
+ * `dragArea` is the one that was wrong for a long time without showing. It
+ * stayed at the naked Wave's 0.59 m² while the power went up **twelvefold**, and
+ * drag is what decides how much load the front axle keeps: holding 49.6 m/s
+ * means pushing 880 N of air, which levers 391 N off an 858 N front and takes
+ * the cornering grip down to 46% of the tyre. A faired machine at this speed is
+ * 0.30–0.35 m² in reality, and 0.32 takes the full-lock radius at 49.6 m/s from
+ * 168.5 m to 126.4 m without the top speed moving — measured 55.01 against the
+ * 55 governor, because the power was never the binding constraint up there.
+ *
+ * The extra mass is the fairing, the frame and the bigger engine that go with
+ * it: 230 kg with a rider against a Wave's 165. It helps the same problem from
+ * the other side — more static load on the front for the same lever to shift —
+ * and takes the radius to 111.7 m on its own.
+ */
+const RIDDEN = { mass: 230, power: 62000, grip: 16.5, dragArea: 0.32 };
 
 /** A motorbike will take a trail, but at a crawl, and only one of them will. */
 const TRAIL_CRUISE = 4.2;
 
 /**
- * What the one you ride yourself will do.
+ * What the one you ride yourself will do — and no longer a table of answers.
  *
- * `SPECS.motorbike.cruise` is 11.5 m/s, which is what a Wave does on an open
- * straight with a rider who knows the road. The player does not: they are
- * reading a lane they have never seen off a camera, between houses, trees and
- * traffic that does not see them. 9 m/s is 32 km/h — a village lane speed, twice
- * `JOG_SPEED`'s 4.5, and 0.64 of the 14 m/s travel stride, so covering ground on
- * foot stays the fastest way to cross a map and the bike stays the way you look
- * at one on the way past.
+ * There used to be three numbers here: `RIDER_TOP = 9`, `RIDER_REVERSE = 1.2`
+ * and `RIDER_PIVOT = 1.1`, with a long argument for the first. The argument was
+ * that a player is reading an unfamiliar lane off a camera, so 9 m/s — 32 km/h —
+ * was enough. It was overruled by the person it was written for: the bike was
+ * slower than the 14 m/s a body covers ground at on foot, so riding one was
+ * strictly worse than walking, and the whole feature read as scenery.
  *
- * Everything else is the machine's own: the acceleration, the brakes and the
- * grip that sets the turning circle are `SPECS.motorbike`, because it is the
- * same motorbike.
+ * All three are gone, because they were outcomes rather than properties. The
+ * machine is now described — mass, power, drag area, rolling resistance, where
+ * the weight sits — and `driving.ts` works the outcomes out: 23.60 m/s flat out
+ * on the Wave, which is the real machine's 85 km/h, reached by the force falling
+ * off against the drag rather than by meeting a clamp. Reverse is the rider's
+ * own feet and the crawl-speed pivot is their legs, both of which that module
+ * derives from the wheelbase and the mass.
+ *
+ * What stays here is what the *world* decides rather than the machine: how steep
+ * a hillside it will attempt, and how deep a flood it will ride through.
  */
-const RIDER_TOP = 9;
-/** m/s backwards — a rider paddling it off the kerb with their feet. */
-const RIDER_REVERSE = 1.2;
-/**
- * Rad/s at a crawl. The grip law gives `grip / v`, which runs away as the bike
- * slows, and this is where the rider's own feet take over: 1.1 rad/s is 63°/s, a
- * U-turn in a lane's width, and it is reached at 4.7 m/s.
- */
-const RIDER_PIVOT = 1.1;
 /**
  * The steepest bare ground it will take: 0.45 is 24°, which is a dirt ramp off a
  * kerb and not a hillside. Measured against the four road networks, no
@@ -1285,6 +277,16 @@ const PARK_LEAN = 0.12;
  * merged into one vertex-coloured geometry, so a bike with ninety parts still
  * costs one draw call for its body.
  */
+/**
+ * Xe máy, xe con, xe tải, xe khách, xe đạp, xích lô, xe trâu — a handful of them,
+ * each built properly, driving the centrelines the road network hands over.
+ *
+ * The materials and the assembler are `vehicle-kit.ts`'s now, because a
+ * companion's bike has to come out of the same pair of shaders as the bus in
+ * front of it. The kit is made here and disposed here, so a rig handed to
+ * another module lives exactly as long as the fleet does — `avatar-ride.ts`
+ * borrows it and `world-renderer.ts` disposes both at the same teardown.
+ */
 export const createVehicles = (
   recipe: LocationRecipe,
   network: RoadNetwork,
@@ -1296,166 +298,11 @@ export const createVehicles = (
   const group = new Group();
   group.name = 'vehicles';
 
-  const geometries: BufferGeometry[] = [];
-  const materials: Material[] = [];
-  const keep = <T extends Material>(material: T): T => {
-    materials.push(material);
-    return material;
-  };
-
-  const bodyMaterial = keep(
-    new MeshStandardMaterial({
-      vertexColors: true,
-      flatShading: true,
-      roughness: 0.55,
-      metalness: 0.08,
-      side: DoubleSide,
-    })
-  );
-  const glassMaterial = keep(
-    new MeshStandardMaterial({
-      vertexColors: true,
-      roughness: 0.12,
-      metalness: 0.1,
-      transparent: true,
-      opacity: 0.86,
-      side: DoubleSide,
-    })
-  );
-  // Unlit materials, so their colour is the whole of their brightness: by day
-  // the lenses have to be dark glass or they glow at noon, which is the mistake
-  // that made the river turquoise at midnight.
-  const lampMaterial = keep(new MeshBasicMaterial({ color: LAMP_DAY.clone() }));
-  const tailMaterial = keep(new MeshBasicMaterial({ color: TAIL_DAY.clone() }));
-  const brakeMaterial = keep(new MeshBasicMaterial({ color: new Color('#ff3a24') }));
-  const glowMaterial = keep(
-    new MeshBasicMaterial({
-      color: new Color('#ffe7b8'),
-      transparent: true,
-      opacity: 0,
-      blending: AdditiveBlending,
-      depthWrite: false,
-      side: DoubleSide,
-    })
-  );
-
-  // One cone, shared by everything with a headlight: apex at the lamp, mouth
-  // seven metres down the road.
-  const glowGeometry = new ConeGeometry(1.25, 7, 10, 1, true);
-  glowGeometry.rotateX(-Math.PI / 2);
-  glowGeometry.translate(0, 0, 3.5);
-  geometries.push(glowGeometry);
-
-  const buildFor = (kind: VehicleKind): Build => {
-    const paint = pick(PAINT, random);
-    switch (kind) {
-      case 'motorbike':
-        return motorbikeBuild(paint, false, random);
-      case 'motorbike-cargo':
-        return motorbikeBuild(paint, true, random);
-      case 'car':
-        return carBuild(paint, random);
-      case 'truck':
-        return truckBuild(paint, random);
-      case 'coach':
-        return coachBuild(paint, pick(PAINT, random));
-      case 'bicycle':
-        return bicycleBuild(paint, random);
-      case 'cyclo':
-        return cycloBuild(paint, random);
-      default:
-        return buffaloCartBuild(random);
-    }
-  };
-
-  const addMesh = (parent: Object3D, parts: Part[], material: Material, shift: number): Mesh | null => {
-    if (parts.length === 0) return null;
-    // mergeParts consumes its inputs, so a Build is good for exactly one rig.
-    if (shift !== 0) for (const part of parts) part.geometry.translate(0, 0, shift);
-    const geometry = mergeParts(parts);
-    if (!geometry) return null;
-    const mesh = new Mesh(geometry, material);
-    mesh.castShadow = true;
-    geometries.push(geometry);
-    parent.add(mesh);
-    return mesh;
-  };
-
-  /**
-   * Hangs one Build on its pivots. Every part list arrives in vehicle
-   * coordinates and is rebased here, which is the only place that has to know
-   * where a node sits — do it in the builders and a lamp ends up half a metre
-   * behind the wheel it is bolted to.
-   */
-  const assemble = (kind: VehicleKind, build: Build): Rig => {
-    const spec = SPECS[kind];
-    const vehicle = new Group();
-    vehicle.name = kind;
-    // Yaw, then pitch, then roll in the body's own frame. The default XYZ order
-    // applies pitch in world space, which tips a cornering vehicle sideways.
-    vehicle.rotation.order = 'YXZ';
-
-    addMesh(vehicle, build.body, bodyMaterial, 0);
-    addMesh(vehicle, build.glass, glassMaterial, 0);
-
-    const rearAxle = new Object3D();
-    rearAxle.position.set(0, spec.wheelRadius, spec.rearAxle);
-    vehicle.add(rearAxle);
-    addMesh(rearAxle, build.rearWheel, bodyMaterial, 0);
-
-    const steer = spec.steersFront ? new Object3D() : null;
-    if (steer) {
-      steer.position.set(0, 0, spec.frontAxle);
-      vehicle.add(steer);
-      addMesh(steer, build.steer, bodyMaterial, -spec.frontAxle);
-    } else {
-      addMesh(vehicle, build.steer, bodyMaterial, 0);
-    }
-
-    const frontAxle = new Object3D();
-    if (steer) {
-      frontAxle.position.set(0, spec.wheelRadius, 0);
-      steer.add(frontAxle);
-    } else {
-      frontAxle.position.set(0, spec.wheelRadius, spec.frontAxle);
-      vehicle.add(frontAxle);
-    }
-    addMesh(frontAxle, build.frontWheel, bodyMaterial, 0);
-
-    // On two wheels the headlight swings with the bars, which is most of why a
-    // motorbike at night reads as a motorbike and not a lamp on a rail.
-    const onSteer = spec.lampOnSteer && steer !== null;
-    const lampParent = onSteer && steer ? steer : vehicle;
-    const lampShift = onSteer ? -spec.frontAxle : 0;
-    addMesh(lampParent, build.head, lampMaterial, lampShift);
-    const tail = addMesh(vehicle, build.tail, tailMaterial, 0);
-
-    let glow: Mesh | null = null;
-    if (build.lamp) {
-      glow = new Mesh(glowGeometry, glowMaterial);
-      glow.position.set(build.lamp[0], build.lamp[1], build.lamp[2] + lampShift);
-      glow.visible = false;
-      lampParent.add(glow);
-    }
-
-    const rider = build.rider.length > 0 ? new Object3D() : null;
-    if (rider) {
-      vehicle.add(rider);
-      addMesh(rider, build.rider, bodyMaterial, 0);
-    }
-
-    const swings: Swing[] = [];
-    for (const entry of build.swing) {
-      const node = new Object3D();
-      node.position.set(entry.at[0], entry.at[1], entry.at[2]);
-      vehicle.add(node);
-      // Swing parts are given relative to their own pivot already.
-      addMesh(node, entry.parts, bodyMaterial, 0);
-      swings.push({ node, phase: entry.phase, gain: entry.gain });
-    }
-
-    group.add(vehicle);
-    return { group: vehicle, rearAxle, frontAxle, steer, rider, swings, tail, glow };
+  const kit = createVehicleKit();
+  const assemble = (kind: VehicleKind, build: Parameters<VehicleKit['assemble']>[1]): Rig => {
+    const rig = kit.assemble(kind, build);
+    group.add(rig.group);
+    return rig;
   };
 
   // --- deal the fleet out ---------------------------------------------------
@@ -1505,7 +352,7 @@ export const createVehicles = (
     }
 
     const spec = SPECS[kind];
-    const rig = assemble(kind, buildFor(kind));
+    const rig = assemble(kind, buildFor(kind, random));
     // Nothing passes on a trail and nothing comes the other way down one.
     const single = chosen.kind === 'trail';
     if (single) trailRiders += 1;
@@ -1527,7 +374,6 @@ export const createVehicles = (
       bob: random() * Math.PI * 2,
     });
   }
-
   // --- parked xe máy, which are the ones you can take ------------------------
   const parked: Rideable[] = [];
   /** True while the player has it: its lamp is lit and its rider is drawn. */
@@ -1582,12 +428,48 @@ export const createVehicles = (
     return { x: spot.x, y: terrain.heightAt(spot.x, spot.z), z: spot.z };
   };
 
-  // Scaled with the tier the way the fleet is, but never to none: these are not
-  // scenery any more, they are how the player gets about, so the lowest tier
-  // still gets one. Static until somebody takes one, so the rest cost nothing.
-  const slots = Math.min(3, network.parking.length, Math.max(1, Math.floor(count / 4)));
-  for (let i = 0; i < slots && network.parking.length > 0; i += 1) {
-    const spot = network.parking[Math.floor((i / slots) * network.parking.length)];
+  /**
+   * One bike at the head of every row, and a second in the first row.
+   *
+   * Not scaled with the detail tier, and deliberately: these are how the player
+   * gets about, not scenery, and they cost nothing to leave standing — each is
+   * one merged geometry and one draw call with no per-frame update until somebody
+   * takes it. What was scaled was the *count*, which on the lowest tier came to a
+   * single bike; and because every slot `road-network` published sat in one row
+   * 0.9 m apart, spreading three bikes over that array put all three within four
+   * metres of each other. A five-kilometre map therefore had one place to get a
+   * motorbike however high you turned the quality up.
+   *
+   * `area` is what fixes it: one bike per row means a bike wherever a row is. The
+   * second in row zero is there so the first place anybody finds has a spare —
+   * two friends arriving together should not be one bike short.
+   */
+  /**
+   * Three machines in every row.
+   *
+   * It was one per row plus a spare in the first, and a row with one bike in it
+   * is a row that is empty the moment anybody takes it — the same defect the
+   * jetty had with a single moored boat. It is also not what a kerb in Vietnam
+   * looks like: bikes are left in a line, and a line of one is a lost bike.
+   *
+   * Three of the four slots `road-network` publishes, not four, so the row still
+   * reads as a place people leave machines rather than a dealership with its
+   * stock out. They cost almost nothing to leave standing: each is one merged
+   * vertex-coloured geometry and one draw call, with no per-frame work at all
+   * until somebody rides it.
+   */
+  const PER_ROW = 3;
+  const filled = new Map<number, number>();
+  const stands: ParkingSpot[] = [];
+  for (const spot of network.parking) {
+    const already = filled.get(spot.area) ?? 0;
+    if (already >= PER_ROW) continue;
+    filled.set(spot.area, already + 1);
+    stands.push(spot);
+  }
+
+  for (let i = 0; i < stands.length; i += 1) {
+    const spot = stands[i];
     const spec = SPECS.motorbike;
     const rig = assemble('motorbike', motorbikeBuild(pick(PAINT, random), false, random, true));
     const where = stand(spot);
@@ -1604,50 +486,102 @@ export const createVehicles = (
       glows.set(id, rig.glow);
     }
     const forward = new Vector3(Math.sin(spot.heading), 0, Math.cos(spot.heading));
-    const wheelbase = spec.frontAxle - spec.rearAxle;
     let spin = 0;
 
-    const machine: Machine = {
-      topSpeed: RIDER_TOP,
-      reverse: RIDER_REVERSE,
-      accel: spec.accel,
+    // The machine's own description, off its spec except where `RIDDEN` is
+    // louder. `tuneDrive` is asked for the top speed rather than told one, so
+    // the figure the HUD shows and the figure the physics produces cannot drift
+    // apart.
+    const drive: DriveSpec = {
+      length: spec.length,
+      width: spec.width,
+      frontAxle: spec.frontAxle,
+      rearAxle: spec.rearAxle,
+      grip: RIDDEN.grip,
       brake: spec.brake,
-      grip: spec.grip,
-      pivot: RIDER_PIVOT,
+      mass: RIDDEN.mass,
+      power: RIDDEN.power,
+      dragArea: RIDDEN.dragArea,
+      rollCrr: spec.rollCrr,
+      massBias: spec.massBias,
+      cgHeight: spec.cgHeight,
+      driveFront: spec.driveFront,
+    };
+
+    const machine: Machine = {
+      drive,
+      topSpeed: tuneDrive(drive).limit,
       climb: RIDER_CLIMB,
       ford: RIDER_FORD,
       mount: () => {
         taken.add(id);
         if (rig.rider) rig.rider.visible = true;
         rig.group.rotation.z = 0;
+        // On the cockpit layer as well as the world's, so the second pass can
+        // draw this one machine with a near plane that can see the bars. Only
+        // while it is being ridden: the other five parked bikes must not appear
+        // in front of the rider's face.
+        rig.group.traverse((node) => node.layers.enable(COCKPIT_LAYER));
         applyLights();
       },
       place: (at: Ridden) => {
         rig.group.position.set(at.x, at.y + TYRE_LIFT, at.z);
         rig.group.rotation.y = at.heading;
         // Nose up the hill, and down on the brakes the way the fleet does it.
-        rig.group.rotation.x = -Math.atan(at.grade);
-        // The angle a free body takes through the bend, which on two wheels is
-        // the whole of it. `turn` is positive to the left and +Z rolls toward −X,
-        // so the sign puts it into the corner rather than out of it.
-        rig.group.rotation.z = -Math.atan((at.speed * at.turn) / GRAVITY) * spec.leanGain;
+        rig.group.rotation.x = -Math.atan(at.grade) - at.brake * 0.03;
+        /**
+         * The angle a free body takes against the cornering force, which on two
+         * wheels is the whole of it.
+         *
+         * Against `lateral` — the force the tyres are actually making — and no
+         * longer against `speed * turn`. The two agree while the machine tracks
+         * and part company exactly where it matters: in a slide the tyres have
+         * given up most of their grip while the yaw rate is at its highest, so
+         * the old form leant a drifting bike hardest at the moment it has least
+         * to lean against, and a handbrake turn looked like a railway curve.
+         *
+         * +Z rolls toward −X, so the sign puts it into the corner.
+         */
+        rig.group.rotation.z = -Math.atan(at.lateral / GRAVITY) * spec.leanGain;
         if (rig.steer) {
-          // Ackermann off the same yaw rate. Below a walking pace the bars would
-          // ask for full lock, which is right but reads as a twitch, so the
-          // divisor floors at 1.5 m/s.
-          const lock = Math.atan((wheelbase * at.turn) / Math.max(1.5, Math.abs(at.speed)));
-          rig.steer.rotation.y = Math.max(-0.52, Math.min(0.52, lock));
+          // The lock the model actually has at the wheel, which in a slide is
+          // turned *into* it — a rider catching the back end is the most
+          // recognisable thing a drift does, and Ackermann off the yaw rate
+          // cannot express it because it assumes the machine is tracking.
+          rig.steer.rotation.y = Math.max(-0.52, Math.min(0.52, at.steer));
         }
-        spin += (at.speed * at.delta) / spec.wheelRadius;
+        // The brake light, off the real brake rather than off a speed drop.
+        if (rig.tail) rig.tail.material = at.brake > 0.15 ? kit.brakeMaterial : kit.tailMaterial;
+        /**
+         * The figure in the saddle is who the first-person camera is, so from
+         * its own eyes it has to go — otherwise the view is the inside of a
+         * skull with a helmet on it.
+         *
+         * All of it, not just the head. `addMesh` merges every part `seatedRider`
+         * produced into one vertex-coloured geometry, which is the whole reason a
+         * bike with ninety parts costs one draw call; keeping the hands on the
+         * bars would mean splitting that build in two and paying a second draw
+         * call on every vehicle in the fleet to buy a detail in one view of one
+         * of them.
+         */
+        if (rig.rider) rig.rider.visible = !at.firstPerson;
+        // The wheels turn with the ground they are on, not with the nose: a
+        // machine sideways still covers ground, and spinning the tyres to the
+        // nose speed stops them dead halfway through a slide.
+        spin +=
+          (Math.hypot(at.speed, at.speed * Math.tan(at.slip)) * Math.sign(at.speed) * at.delta) / spec.wheelRadius;
         rig.rearAxle.rotation.x = spin;
         rig.frontAxle.rotation.x = spin;
         forward.set(Math.sin(at.heading), 0, Math.cos(at.heading));
       },
       park: () => {
         taken.delete(id);
+        rig.group.traverse((node) => node.layers.disable(COCKPIT_LAYER));
         if (rig.rider) rig.rider.visible = false;
         rig.group.rotation.x = 0;
         rig.group.rotation.z = PARK_LEAN;
+        if (rig.steer) rig.steer.rotation.y = 0;
+        if (rig.tail) rig.tail.material = kit.tailMaterial;
         applyLights();
       },
     };
@@ -1681,6 +615,34 @@ export const createVehicles = (
     queue.push(index);
   });
 
+  // --- the fleet as bodies something else can hit --------------------------
+  /**
+   * One `Impactor` per moving vehicle, rewritten in place at the end of every
+   * tick and handed out by reference.
+   *
+   * Only the *moving* fleet is in it. A parked bike is not, and that is not an
+   * oversight: the one the player is sitting on is a parked bike, there is
+   * nothing on an `Impactor` to tell it apart from the other five, and a rider
+   * resolved against the machine under them is pinned to the kerb for ever.
+   */
+  const bodies: Impactor[] = agents.map(() => createImpactor());
+  /**
+   * Whether the first tick has run. Before it has, every vehicle is still at the
+   * origin with the default radius `createImpactor` gives it, and handing that
+   * list out puts a phantom coach at the middle of the map.
+   */
+  let placed = false;
+
+  /**
+   * The player, as a body the fleet can see. Null until somebody goes for a
+   * walk — `world-renderer.ts` makes the walker long after the fleet, and only
+   * once the view goes down to the ground.
+   *
+   * Set rather than passed for that reason, and read through a getter for the
+   * usual one: the walker rewrites its own body in place every frame.
+   */
+  let rider: (() => Impactor | null) | null = null;
+
   // --- per-frame scratch, hoisted: the tick allocates nothing ---------------
   const here: RoadSample = { x: 0, y: 0, z: 0, tx: 0, tz: 1, curvature: 0 };
   const ahead: RoadSample = { x: 0, y: 0, z: 0, tx: 0, tz: 1, curvature: 0 };
@@ -1689,7 +651,6 @@ export const createVehicles = (
   let lit = 0;
   let wet = 0;
   let slow = 1;
-
   const update = (elapsed: number) => {
     if (agents.length === 0) return;
     const delta = last < 0 ? 0.016 : Math.min(0.1, Math.max(0, elapsed - last));
@@ -1724,6 +685,14 @@ export const createVehicles = (
         let target = agent.cruise * slow;
         if (bend > 1e-4) target = Math.min(target, Math.sqrt(spec.grip / bend));
 
+        // Right of travel is (−fz, fx), the same convention the road network uses
+        // for its own lane offsets and kerbside furniture. Needed up here as well
+        // as below now, because the gap to the player is measured in this frame.
+        const fx = here.tx * agent.dir;
+        const fz = here.tz * agent.dir;
+        const atX = here.x - fz * agent.lane;
+        const atZ = here.z + fx * agent.lane;
+
         if (queue.length > 1) {
           const leader = agents[queue[(i + 1) % queue.length]];
           let gap = (leader.distance - agent.distance) * agent.dir;
@@ -1731,6 +700,50 @@ export const createVehicles = (
           gap -= (spec.length + leader.spec.length) / 2;
           const want = spec.gap + agent.speed * 0.9;
           if (gap < want) target = Math.min(target, Math.max(0, (gap / want) * target));
+        }
+
+        /**
+         * And the player, who until now was not in this calculation at all.
+         *
+         * That is the other half of the user's report. `driving-collision.ts`
+         * decides what a hit costs, but a coach that drives into somebody at
+         * cruise was never going to brake, because an agent's target speed came
+         * only off the bend and off the agent in front of it — and a bike stopped
+         * in the lane is neither. So the same gap law the queue uses is applied
+         * to the player: nose to tail, closing on the thing ahead, at the brake
+         * the vehicle has.
+         *
+         * Measured in the agent's own frame rather than as a distance along the
+         * centreline, which is the only form that answers the question. A player
+         * is not on the queue: they can be stopped across the lane, cutting the
+         * corner, or on the verge, and `distance` has nothing to say about any of
+         * those. Six multiplies gives the metres in front and the metres to the
+         * side, and the side is what decides whether it is in the way.
+         *
+         * It brakes and does not swerve, which is a decision and not a shortcut.
+         * `agent.lane` is the lane this vehicle lives in, chosen once off
+         * `road.laneOffset` with the sign of `dir`; moving it would put a 10.5 m
+         * coach across a 5.5 m secondary road's centreline into oncoming traffic,
+         * and the queue sorts purely on `distance`, so two agents at one distance
+         * in two lanes would read as a vehicle to brake for rather than one being
+         * passed. That is a traffic model. Braking is the reaction, and being
+         * shoved aside by whatever does touch you is `collideDrive`'s half.
+         */
+        const body = rider?.();
+        if (body) {
+          const toX = body.x - atX;
+          const toZ = body.z - atZ;
+          const front = toX * fx + toZ * fz;
+          const side = toX * -fz + toZ * fx;
+          // Half the lane plus a body: inside this it is in the way, outside it
+          // the vehicle goes past. `Impactor.radius` is the mean half-extent its
+          // owner published, so a coach gives way to a coach's width of room.
+          const across = spec.width / 2 + body.radius;
+          if (front > 0 && Math.abs(side) < across) {
+            const gap = front - (spec.length / 2 + body.radius);
+            const want = spec.gap + agent.speed * 0.9;
+            if (gap < want) target = Math.min(target, Math.max(0, (gap / want) * target));
+          }
         }
 
         const was = agent.speed;
@@ -1744,11 +757,10 @@ export const createVehicles = (
         if (agent.distance > road.totalLength) agent.distance -= road.totalLength;
         if (agent.distance < 0) agent.distance += road.totalLength;
 
-        const fx = here.tx * agent.dir;
-        const fz = here.tz * agent.dir;
-        // Right of travel is (−fz, fx), the same convention the road network uses
-        // for its own lane offsets and kerbside furniture.
-        agent.group.position.set(here.x - fz * agent.lane, here.y + 0.012, here.z + fx * agent.lane);
+        // Against the sample this frame's decisions were made from, which is one
+        // step behind where the integration has just put it: re-sampling here
+        // would cost a second `sampleAt` per vehicle to move a 10 cm position.
+        agent.group.position.set(atX, here.y + 0.012, atZ);
         agent.group.rotation.y = Math.atan2(fx, fz);
         agent.group.rotation.x = -Math.atan2((ahead.y - here.y) * agent.dir, look) + agent.braking * 0.022;
 
@@ -1779,17 +791,32 @@ export const createVehicles = (
           agent.rider.position.y = Math.sin(elapsed * 7.3 + agent.bob) * 0.006 * Math.min(1, agent.speed / 6);
         }
 
-        if (agent.tail) agent.tail.material = agent.braking > 0.4 ? brakeMaterial : tailMaterial;
+        if (agent.tail) agent.tail.material = agent.braking > 0.4 ? kit.brakeMaterial : kit.tailMaterial;
+
+        // And this vehicle as something that can be driven into. The velocity is
+        // the lane's own direction, which is the honest one: an agent has no
+        // slide, it is a position on a queue, so its nose and its travel are the
+        // same vector by construction.
+        const seen = bodies[queue[i]];
+        seen.x = atX;
+        seen.z = atZ;
+        seen.vx = fx * agent.speed;
+        seen.vz = fz * agent.speed;
+        seen.mass = spec.mass;
+        // The mean half-extent, which is `DriveTuning.radius`'s own definition —
+        // a circle is wrong for a 10.5 m coach and right for everything else, and
+        // `driving-collision.ts` takes the contact on the box regardless.
+        seen.radius = (spec.length + spec.width) / 4;
       }
     }
+
+    placed = true;
   };
 
   const applyLights = () => {
     // Daylight in heavy rain is dark enough that everyone has their lights on.
     const on = Math.max(lit, wet > 0.32 ? 0.65 : 0);
-    lampMaterial.color.copy(LAMP_DAY).lerp(LAMP_NIGHT, on);
-    tailMaterial.color.copy(TAIL_DAY).lerp(TAIL_NIGHT, on);
-    glowMaterial.opacity = on * 0.085;
+    kit.setLit(on);
     for (const agent of agents) {
       if (agent.glow) agent.glow.visible = on > 0.08;
     }
@@ -1814,10 +841,17 @@ export const createVehicles = (
       slow = 1 - wet * 0.26;
       applyLights();
     },
+    kit,
+    traffic: () => (placed ? bodies : NONE),
+    watch: (body) => {
+      rider = body;
+    },
     dispose: () => {
-      for (const geometry of geometries) geometry.dispose();
-      for (const material of materials) material.dispose();
+      kit.dispose();
       group.clear();
+      bodies.length = 0;
+      placed = false;
+      rider = null;
       agents.length = 0;
       parked.length = 0;
       glows.clear();

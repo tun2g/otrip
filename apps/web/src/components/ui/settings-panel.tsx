@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 
-import type { SettingsState } from '@/hooks/use-settings';
+import { FOV_MAX, FOV_MIN, type SettingsState } from '@/hooks/use-settings';
 import { QUALITY_LABELS, type QualityTier } from '@/scene/quality';
 import { cn } from '@/lib/utils';
 
@@ -79,6 +79,66 @@ export const SettingsPanel = ({ settings }: { settings: SettingsState }) => {
               onChange={(event) => settings.update({ sensitivity: Number(event.target.value) / 100 })}
               className="w-full accent-accent"
             />
+          </div>
+
+          <div className="space-y-1.5">
+            <p className="text-[0.65rem] tracking-wide text-subtle uppercase">Thoải mái</p>
+
+            <button
+              type="button"
+              onClick={() => settings.update({ cameraMotion: !settings.cameraMotion })}
+              aria-pressed={settings.cameraMotion}
+              className={cn(
+                'flex w-full items-center gap-2 rounded-control border border-border px-2 py-1 transition-colors hover:border-accent',
+                settings.cameraMotion && 'border-accent text-accent'
+              )}
+            >
+              <span className="flex-1 text-left">Máy quay tự nghiêng, lắc</span>
+              <span className="text-subtle">{settings.cameraMotion ? 'Bật' : 'Tắt'}</span>
+            </button>
+            <p className="text-[0.65rem] leading-relaxed text-subtle">
+              Tắt thì chân trời luôn nằm ngang: máy quay không nghiêng khi rẽ, không ngả theo thuyền, không lùi ra khi
+              chạy nhanh.
+            </p>
+
+            {/* Two sliders on one line: the panel is 16rem inside a w-64 and this
+                is its fourth section, so a phone in portrait runs out of screen
+                before it runs out of settings. */}
+            <div className="grid grid-cols-2 gap-2">
+              <div className="space-y-1">
+                <label htmlFor="otrip-vignette" className="block text-[0.65rem] text-subtle">
+                  Tối viền · {Math.round(settings.vignette * 100)}%
+                </label>
+                <input
+                  id="otrip-vignette"
+                  type="range"
+                  min={0}
+                  max={100}
+                  value={Math.round(settings.vignette * 100)}
+                  onChange={(event) => settings.update({ vignette: Number(event.target.value) / 100 })}
+                  className="w-full accent-accent"
+                />
+              </div>
+
+              <div className="space-y-1">
+                <label htmlFor="otrip-fov" className="block text-[0.65rem] text-subtle">
+                  Góc nhìn · {settings.fov}°
+                </label>
+                <input
+                  id="otrip-fov"
+                  type="range"
+                  min={FOV_MIN}
+                  max={FOV_MAX}
+                  value={settings.fov}
+                  onChange={(event) => settings.update({ fov: Number(event.target.value) })}
+                  className="w-full accent-accent"
+                />
+              </div>
+            </div>
+            <p className="text-[0.65rem] leading-relaxed text-subtle">
+              Tối viền làm rìa hình mất màu và tối đi lúc bạn đang chạy — rìa mắt là chỗ cảm giác chuyển động dồn vào.
+              Góc nhìn hẹp lại cũng đỡ say, bù lại thấy ít cảnh hai bên hơn.
+            </p>
           </div>
         </div>
       )}

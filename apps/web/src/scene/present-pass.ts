@@ -126,6 +126,45 @@ const NIGHT_FLOOR_TOP = 0.075;
 const NIGHT_LAMP_LOW = 0.12;
 const NIGHT_LAMP_HIGH = 0.5;
 
+/**
+ * The peripheral comfort mask: where it starts, how much colour and how much
+ * light it takes at the corner, and the level the corner falls toward.
+ *
+ * Simulator sickness on a flat screen comes from vection — the eye reporting
+ * self-motion while the vestibular system reports sitting still — and most of
+ * that signal arrives in peripheral vision. Restricting the periphery while the
+ * viewer is moving is the established mitigation, and it is the only one that is
+ * free in a pass that already composites every pixel of the frame.
+ *
+ * INNER is in corner-normalised radius (see the shader), so 0.45 leaves the
+ * middle 45% of the way out to the corner completely untouched. On 16:9 that
+ * puts the top and bottom edge centres at radius 0.49, barely inside the ramp,
+ * and the left and right edge centres at 0.87, well inside it — which is the
+ * right bias, because walking and riding produce horizontal optic flow and it is
+ * the side of the frame that is streaming past.
+ *
+ * CHROMA and FADE are the amounts reached at the corner when the caller asks for
+ * the full 1.0. CHROMA is the larger of the two deliberately: taking the colour
+ * out is what makes the edge stop reading as a place you could look at, while
+ * taking the light out past about half just reads as a letterbox — and a
+ * letterbox is a border drawn over the world rather than a periphery that has
+ * fallen away from it. Measured through the compiled shader, a vivid
+ * (204, 51, 26) at the centre comes back from the corner as (49, 39, 37): its
+ * saturation drops from 0.87 to 0.25, so roughly seven tenths of the colour is
+ * gone while the pixel is still plainly lit rather than blacked out.
+ *
+ * SURROUND is a scene-linear level, since the mask runs before the tone mapper.
+ * It is not zero for the same reason NIGHT_FLOOR is not: ACES crushes anything
+ * under about 0.02 linear to black, and a black ring is the letterbox again.
+ * Measured at 0.03: a lantern at 1.0 linear still comes through the corner at
+ * 0.47, so the lights that make a night street worth looking at survive the
+ * mask, and a mid-grey 0.5 surface lands at 0.24 rather than at nothing.
+ */
+const VIGNETTE_INNER = 0.45;
+const VIGNETTE_CHROMA = 0.85;
+const VIGNETTE_FADE = 0.55;
+const VIGNETTE_SURROUND = 0.03;
+
 const FRAGMENT_SHADER = /* glsl */ `
   uniform sampler2D tDiffuse;
   uniform sampler2D tBloom;
@@ -144,6 +183,7 @@ const FRAGMENT_SHADER = /* glsl */ `
   uniform vec3 uSunDirection;
   uniform vec3 uEye;
   uniform mat4 uClipToWorld;
+  uniform float uVignette;
 
   uniform float uDebug;
   uniform float uEncode;
@@ -274,6 +314,57 @@ const FRAGMENT_SHADER = /* glsl */ `
       return;
     }
 
+    // The peripheral comfort mask, driven from outside by how fast the viewer is
+    // moving. Three things decided where in main it sits, and all three rule out
+    // simply appending it.
+    //
+    // After the aerial perspective and after the night transform, because the
+    // mask is a property of the viewer and not of the air: hazing a surface and
+    // then masking it is a photograph of a hazy valley seen through a narrowed
+    // aperture, while masking first and then hazing would mix airlight back into
+    // the corner it had just been taken out of and undo the effect.
+    //
+    // Before the quantiser, which is the part that is not obvious. Measured on a
+    // mid-grey frame at full strength, the ramp takes the output from 128 to 62
+    // of 255 across radius 0.45 to 1.0 — 6.2 steps of the 24-level quantiser,
+    // spread over the outer half of the frame. Undithered that is six concentric
+    // rings about 65 screen pixels apart on a 1280x720 canvas, and the pixel
+    // style blits up with nearest-neighbour, so each ring would arrive as a hard
+    // staircase rather than a soft edge. Rings are exactly what the dither next
+    // door exists to break up for the sky; put here, the mask goes through that
+    // same Bayer dither and comes out as noise instead.
+    //
+    // After the uDebug branches, so the distance and airless passes the
+    // measurement harness reads back are the raw diagnostics they claim to be
+    // rather than diagnostics with a mask over them.
+    if (uVignette > 0.0) {
+      // Aspect correction in two steps, both needed. Scaling x by the aspect
+      // ratio makes the contours circles rather than an ellipse stretched along
+      // whichever axis the window is longer in. Dividing by the corner's own
+      // distance then makes the corner radius exactly 1.0 on every aspect, so
+      // the share of the frame the mask covers is the same on a 16:9 desktop and
+      // a 9:16 phone. Without it the corner sits at 2.04 on the desktop and 1.15
+      // on the phone, and one setting means two different effects: the desktop
+      // saturates the ramp inside its own top and bottom edges and becomes a
+      // tunnel, while the phone's side edges reach only 0.56 and barely dim at
+      // all. Measured with it, both land on 62 of 255 at the corner.
+      float aspect = uResolution.x / max(uResolution.y, 1.0);
+      vec2 offset = (vUv - 0.5) * vec2(2.0 * aspect, 2.0);
+      float radius = length(offset) / length(vec2(aspect, 1.0));
+      float mask = uVignette * smoothstep(${VIGNETTE_INNER}, 1.0, radius);
+
+      // Chroma out first, then a lerp toward a fixed dim surround rather than a
+      // multiply. A multiply preserves the ratio between two neighbouring
+      // pixels, and so preserves the edge contrast the eye is tracking the
+      // motion by; a lerp toward a constant collapses that difference by the
+      // same factor it darkens. Losing the colour and the local contrast is what
+      // makes the periphery read as falling away, which is the cue being
+      // suppressed. Merely darkening it leaves every moving edge intact behind a
+      // dark ring.
+      colour = mix(colour, vec3(dot(colour, LUMA)), mask * ${VIGNETTE_CHROMA});
+      colour = mix(colour, vec3(${VIGNETTE_SURROUND}), mask * ${VIGNETTE_FADE});
+    }
+
     if (uLevels > 0.0) {
       // Quantising to a fixed number of levels is what sells the pixel look, but
       // a smooth sky bands badly under it — the dither trades those rings for
@@ -305,11 +396,38 @@ export type PresentPass = {
   setStyle: (style: RenderStyle) => void;
   setBloom: (strength: number) => void;
   /**
+   * How hard the peripheral comfort mask bites, 0–1, where 0 is off.
+   *
+   * The caller hands over the already-combined product of the viewer's own
+   * strength preference and how fast they are moving. Keeping it to one number
+   * is the point: this module composites a frame and has no business knowing
+   * that a walker exists, let alone what its running speed is.
+   */
+  setVignette: (amount: number) => void;
+  /**
    * Everything the finish needs from the world's one weather: how far you can
    * see, where the sun is and what the air is coloured. Call it wherever the
    * sky is pushed to the rest of the scene, before `render`.
    */
   applySky: (colors: ResolvedSky, sunDirection: Vector3, sunElevation: number, weather: WorldWeather) => void;
+  /**
+   * Something drawn into the same buffer after the world and before the finish,
+   * with the depth buffer cleared between — a cockpit, and nothing else so far.
+   *
+   * Between those two points on purpose. The bloom, the shafts, the aerial
+   * perspective and the night transform all read this buffer, so a cockpit drawn
+   * here picks up the Hội An lanterns like everything else in the frame;
+   * composited afterwards it would be a sticker on a photograph. And the depth
+   * clear is what lets it have its own near plane: the ridden machine is always
+   * in front of the whole world, so it needs no depth relationship with any of
+   * it, which is the only reason two passes can disagree about `near` and still
+   * produce one coherent image.
+   *
+   * Null is the normal case and costs nothing — no second pass, no clear, no
+   * renderer state touched. This module still knows nothing about walkers or
+   * machines; it knows there is sometimes a second thing to draw.
+   */
+  setOverlay: (draw: ((renderer: WebGLRenderer) => void) | null) => void;
   render: (renderer: WebGLRenderer, scene: Scene, camera: Camera) => void;
   /** Renders one frame off-screen at an exact size, for the postcard. */
   capture: (renderer: WebGLRenderer, scene: Scene, camera: Camera, width: number, height: number) => Capture;
@@ -377,6 +495,7 @@ export const createPresentPass = (
       uSunDirection: { value: new Vector3(0, 1, 0) },
       uEye: { value: new Vector3() },
       uClipToWorld: { value: new Matrix4() },
+      uVignette: { value: 0 },
       uDebug: { value: 0 },
       uEncode: { value: 0 },
       uExposure: { value: 1 },
@@ -458,9 +577,28 @@ export const createPresentPass = (
   let skyReport = 'applySky never called';
   const measureSize = new Vector2();
 
+  /** The cockpit, or null. See `setOverlay`. */
+  let overlay: ((renderer: WebGLRenderer) => void) | null = null;
+
+  /**
+   * The second pass, with the target still bound: clear the depth so the overlay
+   * has the whole buffer in front of it, draw, and put `autoClear` back where it
+   * was found. Restored rather than assumed, because the renderer is shared with
+   * the shadow passes and the composite quads.
+   */
+  const drawOverlay = (renderer: WebGLRenderer) => {
+    if (!overlay) return;
+    const wasAutoClear = renderer.autoClear;
+    renderer.autoClear = false;
+    renderer.clearDepth();
+    overlay(renderer);
+    renderer.autoClear = wasAutoClear;
+  };
+
   const present = (renderer: WebGLRenderer, scene: Scene, camera: Camera) => {
     renderer.setRenderTarget(target);
     renderer.render(scene, camera);
+    drawOverlay(renderer);
 
     composite(renderer, target, camera);
 
@@ -594,6 +732,9 @@ export const createPresentPass = (
 
       shafts.applySky(colors, sunDirection, sunElevation, weather);
     },
+    setOverlay: (draw) => {
+      overlay = draw;
+    },
     render: (renderer, scene, camera) => {
       present(renderer, scene, camera);
       if (measureWanted) runMeasure(renderer);
@@ -618,9 +759,20 @@ export const createPresentPass = (
       const previousMap = material.uniforms.tDiffuse.value;
       const previousDepth = material.uniforms.tDepth.value;
       const previousResolution = material.uniforms.uResolution.value.clone();
+      const previousVignette = material.uniforms.uVignette.value;
+
+      // Nobody is moving while they look at the photograph afterwards, so the
+      // mask has nothing to suppress and only costs the picture its corners. It
+      // is turned off here and restored below, the same way uEncode is, because
+      // the screen is mid-walk and expects to find it where it left it.
+      material.uniforms.uVignette.value = 0;
 
       renderer.setRenderTarget(sourceTarget);
       renderer.render(scene, camera);
+      // The postcard gets the bars too: it is what the photographer was looking
+      // at, and a picture taken from the saddle without them is a picture from
+      // nowhere. It costs the same second pass the screen already pays.
+      drawOverlay(renderer);
 
       material.uniforms.tDiffuse.value = sourceTarget.texture;
       material.uniforms.tDepth.value = sourceTarget.depthTexture;
@@ -647,6 +799,7 @@ export const createPresentPass = (
       renderer.setRenderTarget(null);
 
       material.uniforms.uEncode.value = 0;
+      material.uniforms.uVignette.value = previousVignette;
       material.uniforms.tDiffuse.value = previousMap;
       material.uniforms.tDepth.value = previousDepth;
       material.uniforms.uResolution.value.copy(previousResolution);
@@ -657,6 +810,13 @@ export const createPresentPass = (
       return { data, width: captureWidth, height: captureHeight };
     },
     setBloom: (value: number) => bloom.setStrength(value),
+    setVignette: (amount) => {
+      // Clamped and checked for finiteness rather than trusted. This number is
+      // multiplied into every pixel of the frame, and the caller computes it
+      // from a speed, which means one divide by a zero frame time upstream would
+      // arrive here as NaN and take the whole image with it.
+      material.uniforms.uVignette.value = Number.isFinite(amount) ? Math.min(1, Math.max(0, amount)) : 0;
+    },
     dispose: () => {
       bloom.dispose();
       shafts.dispose();

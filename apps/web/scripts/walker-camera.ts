@@ -1,19 +1,32 @@
 /**
- * Camera-occlusion probe for `walker.ts`.
+ * Camera probe for `walker.ts`: where the body lands in the picture, and what
+ * the view does that nobody asked it to.
  *
- * The third-person camera sweeps the line from the head back to its trailing
- * position and pulls in to the first blocked sample; under about two metres the
- * avatar is hidden and the view becomes first person. That is deliberate — a
- * body at arm's length fills the lens — but it means any sweep that fires
- * constantly reads to a player as "the character has disappeared", which is
- * exactly what was reported.
+ * The rig is an orbit. It swings about a point on the chest and aims through it,
+ * so the body holds one screen position at every pitch; the sweep from the pivot
+ * out to the camera shortens it when the ground or anything built is on that
+ * line, and inside the two metres a body cannot be drawn whole in the body
+ * stands aside and the view is first person.
  *
- * So this walks each location for a few hundred metres and measures the thing
- * the player sees: what share of the walk the avatar is hidden for, how far the
- * camera was allowed to trail, and which branch of the sweep took it away.
+ * Both halves of that are measured here, because both have been reported as
+ * bugs by players: "the character has disappeared", which is the sweep firing
+ * too readily, and "góc nhìn phải lấy nhân vật làm trung tâm" — the view must
+ * take the character as its centre — which is the framing.
  *
  *   node --experimental-strip-types apps/web/scripts/walker-camera.ts
  *   node --experimental-strip-types apps/web/scripts/walker-camera.ts --only=ho-tay
+ *
+ * Per location it walks a few hundred metres and measures what share of the walk
+ * the avatar is hidden for, how far the camera was allowed to trail, which
+ * branch took it away, how far the lens cleared the ground, and the frame-to
+ * frame swing of the view with no look input at all. Then it stands still and
+ * sweeps the pitch through its whole range at three distances, projecting the
+ * chest to see whether it moves.
+ *
+ * Every walk is also judged by the look-direction rig the orbit replaced — the
+ * camera placed on a trailing line that held still above the horizon and was
+ * stood on top of the ground rather than stopped by it — so the before and after
+ * come off one instrument and one walk.
  *
  * The sweep is re-implemented here rather than exported from `walker.ts`, so
  * every run cross-checks the replica against the walker's own answer — the
@@ -42,15 +55,45 @@ registerHooks({
   },
 });
 
-// `walker.ts` binds keyboard, pointer and pointer-lock listeners the moment it
-// is created, and several shader modules read `window.devicePixelRatio` behind a
-// `typeof window` guard — so the ratio is declared rather than left undefined.
+/**
+ * The least `window`, `document` and the canvas can be and still carry an
+ * event: a map of type to handlers, with `emit`.
+ *
+ * They were no-ops while the only thing being measured was a walk in a straight
+ * line, where the camera never turns. The framing sweep has to turn it, and the
+ * only way in is the one the player has — a mouse event, through the listeners
+ * `walker.ts` binds for itself. Driving `cameraPitch` any other way would be
+ * measuring a camera nobody can ask for.
+ */
+type Bus = {
+  addEventListener: (type: string, handler: (event: never) => void) => void;
+  removeEventListener: (type: string, handler: (event: never) => void) => void;
+  emit: (type: string, event: unknown) => void;
+};
+
+const createBus = (extra: Record<string, unknown> = {}): Bus & Record<string, unknown> => {
+  const handlers = new Map<string, Set<(event: never) => void>>();
+  return {
+    ...extra,
+    addEventListener: (type, handler) => {
+      const set = handlers.get(type) ?? new Set();
+      set.add(handler);
+      handlers.set(type, set);
+    },
+    removeEventListener: (type, handler) => handlers.get(type)?.delete(handler),
+    emit: (type, event) => {
+      for (const handler of [...(handlers.get(type) ?? [])]) handler(event as never);
+    },
+  };
+};
+
+// Several shader modules read `window.devicePixelRatio` behind a `typeof window`
+// guard, so the ratio is declared rather than left undefined.
 const globals = globalThis as unknown as Record<string, unknown>;
 globals.self = globalThis;
-globals.window = { addEventListener: () => {}, removeEventListener: () => {}, devicePixelRatio: 1 };
-globals.document = {
-  addEventListener: () => {},
-  removeEventListener: () => {},
+const windowBus = createBus({ devicePixelRatio: 1 });
+globals.window = windowBus;
+const documentBus = createBus({
   pointerLockElement: null,
   exitPointerLock: () => {},
   // GLTFLoader decodes the nature kit's texture atlas through an <img>.
@@ -61,7 +104,8 @@ globals.document = {
     removeEventListener: () => {},
     src: '',
   }),
-};
+});
+globals.document = documentBus;
 
 const { createTerrain, LOCATIONS, LOCATION_SLUGS } = await import('@otrip/world');
 const { PerspectiveCamera: Camera, Mesh, Vector3 } = await import('three');
@@ -108,24 +152,62 @@ const seeded = <T>(build: () => T): T => {
   }
 };
 
-/** What `createWalker` binds its listeners to. Nothing here sends it an event. */
-const listener = { addEventListener: () => {}, removeEventListener: () => {} } as unknown as HTMLElement;
+/** What `createWalker` binds its listeners to: the canvas, as far as it knows. */
+const canvasBus = createBus({ setPointerCapture: () => {}, requestPointerLock: () => {} });
+const listener = canvasBus as unknown as HTMLElement;
+
+/**
+ * The pointer, captured. `walker.ts` only reads `movementX`/`movementY` once
+ * `document.pointerLockElement` is the element it was built on and a
+ * `pointerlockchange` has told it so, which is the one path that turns a mouse
+ * delta into radians at the sensitivity the player actually gets.
+ */
+const grabPointer = () => {
+  documentBus.pointerLockElement = listener;
+  documentBus.emit('pointerlockchange', {});
+};
+
+/** Radians per pixel the walker turns at, copied from `walker.ts`. */
+const BASE_SENSITIVITY = 0.0022;
+
+/** Mouse travel in pixels, as a locked pointer reports it. */
+const mouseBy = (deltaX: number, deltaY: number) =>
+  windowBus.emit('mousemove', { movementX: deltaX, movementY: deltaY });
+
+/** One notch of the wheel: `walker.ts` moves the distance 1.6 m per notch. */
+const WHEEL_STEP = 1.6;
+const wheelBy = (notches: number) => {
+  for (let step = 0; step < Math.abs(notches); step += 1) {
+    canvasBus.emit('wheel', { deltaY: Math.sign(notches), preventDefault: () => {} });
+  }
+};
 
 // The sweep's own constants, copied from `walker.ts`. Any of these drifting is
 // what the replica cross-check is for.
+/** How far the look-direction rig this replaced stood the camera over the head. */
 const CAMERA_HEIGHT = 2.5;
-const CAMERA_CLEARANCE = 1.4;
+const CAMERA_CLEARANCE = 0.3;
+const WATER_SKIM = 0.25;
 const OCCLUSION_SAMPLES = 10;
 const DEFAULT_DISTANCE = 8.5;
 const FIRST_PERSON_UNDER = 2;
 /** Seconds of held occlusion before the view gives up, matching `walker.ts`. */
 const FIRST_PERSON_AFTER = 0.4;
 const BUILDING_HEAD = 0.8;
-const START_PITCH = -0.07;
+/** How far right of the view the rig sits at `DEFAULT_DISTANCE`. */
+const CAMERA_SHOULDER = 0.55;
+/** How fast the rig shortens and lets back out, and how fast the pivot rises. */
+const TUCK_IN = 20;
+const TUCK_OUT = 5;
+const PIVOT_RISE = 4;
+const PIVOT_SNAP = 2.5;
+const START_PITCH = -0.29;
 
 /** Frames of walking per location, at 60 Hz, and the stick they are driven with. */
 const FRAMES = 60 * 150;
 const DELTA = 1 / 60;
+/** Frames the camera is given to reach the walker before anything is believed. */
+const ARRIVAL = 60;
 
 const argument = (name: string, fallback: string): string => {
   const found = process.argv.find((value) => value.startsWith(`--${name}=`));
@@ -230,6 +312,12 @@ type Blame = {
  * The sweep from `walker.ts`, re-run so the branch that fired can be named. The
  * walker passes no platforms in this probe, so its `floorAt` is the terrain and
  * the ground branch is exact.
+ *
+ * `legacy` is the rig the orbit replaced, so that one walk can be judged both
+ * ways: the camera placed along `rigOut`/`rigLift` — a trailing line that held
+ * still above the horizon and was stood on top of the ground rather than
+ * stopped by it — against the orbit, which swings about the chest and treats
+ * the ground as the occluder it is.
  */
 const sweep = (
   terrain: ReturnType<typeof createTerrain>,
@@ -237,33 +325,62 @@ const sweep = (
   canopy: { near: (x: number, z: number, into?: Obstacle[]) => Obstacle[] } | null,
   position: { x: number; y: number; z: number },
   headY: number,
+  /** The eased orbit centre the walker is actually swinging about. */
+  pivotY: number,
   cameraYaw: number,
   cameraPitch: number,
   footY: number,
-  /**
-   * False reproduces the rule this change replaced: the ground blocking like a
-   * wall, and buildings as the circle around them rather than the walls.
-   */
+  waterLevel: number,
   legacy: boolean
 ): Blame => {
   const horizontal = Math.cos(cameraPitch);
   const lift = Math.sin(cameraPitch);
   const distance = DEFAULT_DISTANCE;
+  const rigLift = Math.min(0, lift);
+  const rigOut = lift > 0 ? 1 : horizontal;
+  const floorOf = (x: number, z: number) =>
+    Math.max(terrain.heightAt(x, z) + CAMERA_CLEARANCE, waterLevel + WATER_SKIM);
+  // The rig's line leans `CAMERA_SHOULDER / DEFAULT_DISTANCE` off the view
+  // direction, because the shoulder offset is a share of the distance. On a
+  // hillside running across the rig that lean is what decides whether the lens
+  // is over the terrain or under it, so the replica carries it.
+  const lean = legacy ? 0 : CAMERA_SHOULDER / DEFAULT_DISTANCE;
+  const lineX = Math.sin(cameraYaw) + Math.cos(cameraYaw) * lean;
+  const lineZ = Math.cos(cameraYaw) - Math.sin(cameraYaw) * lean;
+  let wasDeficit = floorOf(position.x, position.z) - pivotY;
+  let wasReach = 0;
 
   for (let sample = 1; sample <= OCCLUSION_SAMPLES; sample += 1) {
     const fraction = sample / OCCLUSION_SAMPLES;
-    const sampleX = position.x - Math.sin(cameraYaw) * horizontal * distance * fraction;
-    const sampleZ = position.z - Math.cos(cameraYaw) * horizontal * distance * fraction;
-    const sampleY = headY + (CAMERA_HEIGHT - lift * distance) * fraction;
+    const along = legacy ? rigOut : horizontal;
+    const reach = distance * fraction;
+    const sampleX = position.x - lineX * along * reach;
+    const sampleZ = position.z - lineZ * along * reach;
+    const sampleY = legacy ? headY + (CAMERA_HEIGHT - rigLift * distance) * fraction : pivotY - lift * reach;
     const allowed = distance * ((sample - 1) / OCCLUSION_SAMPLES);
 
-    // The ground only ever blocked under the old rule. It now raises the camera
-    // instead, which is handled in the walker and shows up in the framing
-    // numbers rather than here.
-    const floor = terrain.heightAt(sampleX, sampleZ);
-    if (legacy && floor + CAMERA_CLEARANCE > sampleY) {
-      return { allowed, branch: 'ground', at: null, depth: floor + CAMERA_CLEARANCE - sampleY };
+    // The ground stopped nothing under the old rule — it raised the camera
+    // instead, which is the one move an orbit cannot make, because lifting the
+    // camera is what slid the body off the frame. Where it stops the orbit, the
+    // crossing is interpolated between samples the same way the walker does it.
+    const deficit = floorOf(sampleX, sampleZ) - sampleY;
+    if (!legacy && deficit > 0) {
+      const span = deficit - wasDeficit;
+      let crossing = Math.max(
+        0,
+        Math.min(span > 1e-6 ? wasReach + (reach - wasReach) * (-wasDeficit / span) : wasReach, reach)
+      );
+      // The walker's two halvings, for the ground between samples that does not
+      // run straight.
+      for (let pass = 0; pass < 2; pass += 1) {
+        const at = floorOf(position.x - lineX * crossing, position.z - lineZ * crossing) - (pivotY - lift * crossing);
+        if (at <= 0) break;
+        crossing = wasReach + (crossing - wasReach) * 0.5;
+      }
+      return { allowed: crossing, branch: 'ground', at: null, depth: deficit };
     }
+    wasDeficit = deficit;
+    wasReach = reach;
 
     if (canopy) {
       const trees = canopy.near(sampleX, sampleZ);
@@ -284,7 +401,9 @@ const sweep = (
       if (building.top + BUILDING_HEAD <= sampleY) continue;
       const span = Math.hypot(sampleX - building.x, sampleZ - building.z);
       if (span >= building.radius) continue;
-      if (!legacy && !insideBuilding(building, sampleX, sampleZ)) continue;
+      // The walls either way: both rigs read the rectangle, which is what lets a
+      // camera see down a lane it is standing in the circumradius of.
+      if (!insideBuilding(building, sampleX, sampleZ)) continue;
       return {
         allowed,
         branch: 'buildings',
@@ -373,6 +492,15 @@ type Walk = {
   lowestHead: number;
   /** Frames the framing statistics were taken over. */
   framed: number;
+  /**
+   * Degrees the camera's forward vector moved between consecutive frames, with
+   * no look input at all. Every one of them is camera motion the player did not
+   * ask for, which is the thing that makes people ill — so this is the number
+   * the comfort work is judged on, not a share or a flag.
+   */
+  swing: number[];
+  /** The least the camera ever cleared the ground by, in metres. */
+  lowClear: number;
   worst: Blame[];
   /** The same walk judged by the rule this change replaced. */
   wasHidden: number;
@@ -393,7 +521,8 @@ const walk = (
   buildings: Building[],
   canopy: { near: (x: number, z: number, into?: Obstacle[]) => Obstacle[] },
   cameraYaw: number,
-  nearTrees: NearTrees | null
+  nearTrees: NearTrees | null,
+  waterLevel: number
 ): Walk => {
   const camera = new Camera(52, 16 / 9, 2, 40_000) as PerspectiveCamera;
   const avatar: { visible: boolean }[] = [];
@@ -416,6 +545,8 @@ const walk = (
     offScreen: 0,
     lowestHead: Infinity,
     framed: 0,
+    swing: [],
+    lowClear: Infinity,
     worst: [],
     wasHidden: 0,
     wasAllowed: [],
@@ -424,12 +555,31 @@ const walk = (
   let lastX = walker.position.x;
   let lastZ = walker.position.z;
   let crowded = 0;
+  let orbit = DEFAULT_DISTANCE;
+  let pivotY = walker.position.y + eyeHeight * CHEST_SHARE;
+  const aim = new Vector3();
+  const wasAim = new Vector3();
 
   for (let frame = 0; frame < FRAMES; frame += 1) {
     walker.update(DELTA, camera);
     out.travelled += Math.hypot(walker.position.x - lastX, walker.position.z - lastZ);
     lastX = walker.position.x;
     lastZ = walker.position.z;
+
+    // The lens direction, read off the quaternion `lookAt` wrote rather than
+    // recomputed from the yaw and pitch: anything the camera does after the aim
+    // — a roll, a lean — is in here too, and is exactly what is being counted.
+    aim.set(0, 0, -1).applyQuaternion(camera.quaternion);
+    // Not the first second. A `PerspectiveCamera` is born at the origin and the
+    // rig has to get it to the walker, which at Tà Xùa is a 350 m flight — it
+    // measured as 81° of swing in a frame and as the lens being 294 m
+    // underground, neither of which is anything a player ever sees.
+    if (frame > ARRIVAL) {
+      const dot = Math.min(1, Math.max(-1, aim.dot(wasAim)));
+      out.swing.push((Math.acos(dot) * 180) / Math.PI);
+      out.lowClear = Math.min(out.lowClear, camera.position.y - terrain.heightAt(camera.position.x, camera.position.z));
+    }
+    wasAim.copy(aim);
 
     const shown = avatar.some((mesh) => mesh.visible);
     if (!shown) out.hidden += 1;
@@ -469,25 +619,28 @@ const walk = (
       canopy,
       walker.position,
       headY,
+      pivotY,
       cameraYaw,
       START_PITCH,
       walker.position.y,
+      waterLevel,
       false
     );
 
-    // The same frame under the rule this change replaced: the circumscribing
-    // circle, and first person the instant a sample came back blocked. The walk
-    // is identical either way — the sweep moves the camera, never the body — so
-    // this is a like-for-like comparison rather than two different walks.
+    // The same frame under the rig the orbit replaced. The walk is identical
+    // either way — the sweep moves the camera, never the body — so this is a
+    // like-for-like comparison rather than two different walks.
     const before = sweep(
       terrain,
       buildings,
       canopy,
       walker.position,
       headY,
+      pivotY,
       cameraYaw,
       START_PITCH,
       walker.position.y,
+      waterLevel,
       true
     );
     out.wasAllowed.push(before.allowed);
@@ -499,8 +652,20 @@ const walk = (
       out.worst.push(verdict);
     }
 
-    crowded = verdict.allowed < FIRST_PERSON_UNDER ? crowded + DELTA : 0;
-    if (crowded >= FIRST_PERSON_AFTER !== !shown) out.disagree += 1;
+    // The rest of the walker's rule, replicated: a block that is not the ground
+    // is waited out for `FIRST_PERSON_AFTER` at two metres, the rig eases to
+    // what is left, and the body stands aside once the lens is inside the two
+    // metres it cannot be drawn whole in.
+    crowded = verdict.allowed < FIRST_PERSON_UNDER && verdict.branch !== 'ground' ? crowded + DELTA : 0;
+    const wantOut =
+      crowded > 0 && crowded < FIRST_PERSON_AFTER ? Math.max(verdict.allowed, FIRST_PERSON_UNDER) : verdict.allowed;
+    orbit += (wantOut - orbit) * (1 - Math.exp(-DELTA * (wantOut < orbit ? TUCK_IN : TUCK_OUT)));
+    if (orbit < FIRST_PERSON_UNDER !== !shown) out.disagree += 1;
+
+    // And the pivot, for the next frame's sweep.
+    const wantPivot = walker.position.y + eyeHeight * CHEST_SHARE;
+    pivotY += (wantPivot - pivotY) * (1 - Math.exp(-DELTA * PIVOT_RISE));
+    if (Math.abs(wantPivot - pivotY) > PIVOT_SNAP) pivotY = wantPivot;
 
     // The near-field trees are not in the sweep at all, so they never shorten
     // `allowed` — they just get drawn between the camera and the avatar. This
@@ -541,21 +706,21 @@ const report = (label: string, result: Walk) => {
     ).toFixed(1)}%`
   );
   console.log(
-    `    before: allowed p10 ${fixed(quantile(result.wasAllowed, 0.1))} median ${fixed(
+    `    look-direction rig: allowed p10 ${fixed(quantile(result.wasAllowed, 0.1))} median ${fixed(
       quantile(result.wasAllowed, 0.5)
     )} · blame ground ${((result.wasBlame.ground / frames) * 100).toFixed(1)}% canopy ${(
       (result.wasBlame.canopy / frames) *
       100
     ).toFixed(1)}% buildings ${((result.wasBlame.buildings / frames) * 100).toFixed(1)}%`
   );
-  const instant = result.allowed.filter((value) => value < FIRST_PERSON_UNDER).length;
+  const tight = result.allowed.filter((value) => value < FIRST_PERSON_UNDER).length;
   console.log(
-    `    of which the sweep itself (ground raising rather than blocking, walls rather than circles) accounts for ${(
-      ((result.wasHidden - instant) / frames) *
-      100
-    ).toFixed(
+    `    the orbit's own sweep leaves the lens inside two metres for ${((tight / frames) * 100).toFixed(
       1
-    )} points and waiting ${FIRST_PERSON_AFTER}s for ${(((instant - result.hidden) / frames) * 100).toFixed(1)} points`
+    )}% of frames, of which the rig's easing and the ${FIRST_PERSON_AFTER}s of patience save ${(
+      ((tight - result.hidden) / frames) *
+      100
+    ).toFixed(1)} points`
   );
   console.log(
     `    framing over ${result.framed} trailing frames: body out of the picture ${(
@@ -563,9 +728,14 @@ const report = (label: string, result: Walk) => {
       100
     ).toFixed(1)}% · lowest the head ever sat ${fixed(result.lowestHead)} in NDC, where -1 is the bottom edge`
   );
-  console.log('    now:');
   console.log(
-    `    allowed min ${fixed(quantile(result.allowed, 0))} p10 ${fixed(quantile(result.allowed, 0.1))} median ${fixed(
+    `    uncommanded camera swing with no look input: median ${fixed(quantile(result.swing, 0.5), 3)}°/frame p99 ${fixed(
+      quantile(result.swing, 0.99),
+      3
+    )}° max ${fixed(Math.max(...result.swing), 3)}° · camera cleared the ground by at least ${fixed(result.lowClear)} m`
+  );
+  console.log(
+    `    orbit: allowed min ${fixed(quantile(result.allowed, 0))} p10 ${fixed(quantile(result.allowed, 0.1))} median ${fixed(
       quantile(result.allowed, 0.5)
     )} of ${DEFAULT_DISTANCE} m · blame ground ${((result.blame.ground / frames) * 100).toFixed(1)}% canopy ${(
       (result.blame.canopy / frames) *
@@ -585,6 +755,139 @@ const report = (label: string, result: Walk) => {
             )} — ${fixed(entry.depth)} m inside`
           : ` — ${fixed(entry.depth)} m under the clearance`
       }`
+    );
+  }
+};
+
+// --- where the character sits in the picture --------------------------------
+
+/**
+ * The pitches the framing is read at, in radians: nearly straight down, half
+ * way, level, and the same either side of the horizon. `MIN_PITCH`/`MAX_PITCH`
+ * are ±1.4, so ±1.2 is as far as anyone looks without being against the stop.
+ */
+const FRAMING_PITCHES = [-1.2, -0.6, 0, 0.6, 1.2];
+/** Notches of the wheel either side of the default, at `WHEEL_STEP` apiece. */
+const FRAMING_NOTCHES = [-3, 0, 3];
+/**
+ * Frames run at each stop before the picture is read. The rig's own followers
+ * are the slowest thing in the loop and none of them has a time constant over
+ * half a second, so a second and a half is settled rather than merely quiet.
+ */
+const SETTLE = 90;
+/**
+ * The orbit pivot, as a share of the eye height — `walker.ts` derives the chest
+ * the same way so that the primitive rig the probe gets (no `humanSource`, so
+ * `PERSON_HEIGHT * 0.9` eyes) and the 1.78 m human agree about where the middle
+ * of a body is.
+ *
+ * Which is also the one thing to read with care here: the probe never downloads
+ * the rigged human, so its chest sits at 1.95 m rather than 1.27, and the orbit
+ * has 68 cm more headroom to swing down through before the ground stops it. The
+ * screen positions below are the rig's own geometry and do not care, but the
+ * pitch at which the body gives way to first person does — that number is
+ * printed for both rigs.
+ */
+const CHEST_SHARE = 1.27 / 1.64;
+
+/** On the flat, the upward pitch at which the ground shortens the rig past
+ *  `FIRST_PERSON_UNDER` and the body stands aside, in degrees. */
+const collapsePitch = (chest: number): number =>
+  (Math.asin(Math.min(1, (chest - CAMERA_CLEARANCE) / FIRST_PERSON_UNDER)) * 180) / Math.PI;
+
+type Shot = {
+  distance: number;
+  pitch: number;
+  /** Where the chest landed, in NDC: ±1 is the edge of the frame. */
+  x: number;
+  y: number;
+  ahead: boolean;
+  shown: boolean;
+  /** Metres from the lens to the chest. */
+  trail: number;
+};
+
+/**
+ * The complaint, measured. "góc nhìn phải lấy nhân vật làm trung tâm" — the
+ * view must take the character as its centre — is a claim about one number:
+ * where the body lands in the picture as the pitch moves. An orbit holds it
+ * still; a camera that only turns its aim lets the body slide out of frame,
+ * which is what was reported.
+ *
+ * Driven through the walker's own mouse listeners at the sensitivity the player
+ * gets, and read by projecting the chest through the camera the walker wrote —
+ * so nothing here knows how the rig is built and the number stands whatever
+ * replaces it.
+ */
+const framing = (walker: ReturnType<typeof createWalker>, label: string) => {
+  const camera = new Camera(52, 16 / 9, 2, 40_000) as PerspectiveCamera;
+  const avatar: { visible: boolean }[] = [];
+  walker.group.traverse((node) => {
+    if (node instanceof Mesh) avatar.push(node as unknown as { visible: boolean });
+  });
+  const chest = PERSON_HEIGHT * 0.9 * CHEST_SHARE;
+  const point = new Vector3();
+
+  grabPointer();
+  walker.setJoystick(null);
+  let pitch = START_PITCH;
+  const shots: Shot[] = [];
+
+  for (const notches of FRAMING_NOTCHES) {
+    wheelBy(notches);
+    const distance = DEFAULT_DISTANCE + notches * WHEEL_STEP;
+
+    for (const target of FRAMING_PITCHES) {
+      // `look` subtracts the mouse travel, so the pixels are the other way about.
+      mouseBy(0, (pitch - target) / BASE_SENSITIVITY);
+      pitch = target;
+      for (let frame = 0; frame < SETTLE; frame += 1) walker.update(DELTA, camera);
+
+      camera.updateMatrixWorld();
+      camera.updateProjectionMatrix();
+      point.set(walker.position.x, walker.position.y + chest, walker.position.z);
+      const trail = point.distanceTo(camera.position);
+      point.project(camera);
+      shots.push({
+        distance,
+        pitch: target,
+        x: point.x,
+        y: point.y,
+        ahead: point.z > -1 && point.z < 1,
+        shown: avatar.some((mesh) => mesh.visible),
+        trail,
+      });
+    }
+
+    wheelBy(-notches);
+  }
+
+  console.log(
+    `  ${label}: chest in the picture, by pitch (NDC, 0 is the centre and ±1 the edge) · on the flat the body gives way to first person above ${fixed(
+      collapsePitch(chest),
+      1
+    )}° of upward pitch on this primitive rig, ${fixed(collapsePitch(1.27), 1)}° on the human one`
+  );
+  for (const notches of FRAMING_NOTCHES) {
+    const row = shots.filter((shot) => shot.distance === DEFAULT_DISTANCE + notches * WHEEL_STEP);
+    const framed = row.filter((shot) => shot.ahead);
+    const spreadY = framed.length > 1 ? Math.max(...framed.map((s) => s.y)) - Math.min(...framed.map((s) => s.y)) : NaN;
+    const spreadX = framed.length > 1 ? Math.max(...framed.map((s) => s.x)) - Math.min(...framed.map((s) => s.x)) : NaN;
+    console.log(
+      `    wheel ${fixed(DEFAULT_DISTANCE + notches * WHEEL_STEP, 1)} m: ${row
+        .map(
+          (shot) =>
+            `${shot.pitch >= 0 ? '+' : ''}${shot.pitch.toFixed(1)} -> ${
+              shot.ahead ? `${shot.y >= 0 ? '+' : ''}${shot.y.toFixed(2)}` : 'behind'
+            }${shot.shown ? '' : ' (hidden)'}`
+        )
+        .join('  ')}`
+    );
+    const held = framed.length > 0 ? framed[0] : null;
+    console.log(
+      `      spread across the pitch range: y ${fixed(spreadY, 3)} x ${fixed(spreadX, 3)} of a 2.0 frame · held at x ${
+        held ? fixed(held.x, 3) : '—'
+      } y ${held ? fixed(held.y, 3) : '—'} · trail ${row.map((shot) => fixed(shot.trail, 1)).join('/')} m`
     );
   }
 };
@@ -631,8 +934,9 @@ const survey = (
       for (let step = 0; step < YAWS; step += 1) {
         const yaw = (step / YAWS) * Math.PI * 2;
         places += 1;
-        const was = sweep(terrain, buildings, canopy, at, headY, yaw, START_PITCH, ground, true);
-        const now = sweep(terrain, buildings, canopy, at, headY, yaw, START_PITCH, ground, false);
+        const pivotY = ground + eyeHeight * CHEST_SHARE;
+        const was = sweep(terrain, buildings, canopy, at, headY, pivotY, yaw, START_PITCH, ground, waterLevel, true);
+        const now = sweep(terrain, buildings, canopy, at, headY, pivotY, yaw, START_PITCH, ground, waterLevel, false);
         if (was.allowed < FIRST_PERSON_UNDER) {
           before += 1;
           if (was.branch === 'buildings' && (!worstBefore || was.depth < worstBefore.depth)) worstBefore = was;
@@ -707,8 +1011,19 @@ const probe = (slug: string, sources: NatureSources) => {
       reducedMotion: true,
     })
   );
-  report('from spawn', walk(fromSpawn, terrain, town.buildings, canopyIndex, facing, nearTrees));
+  report('from spawn', walk(fromSpawn, terrain, town.buildings, canopyIndex, facing, nearTrees, waterLevel));
   fromSpawn.dispose();
+
+  // Standing still at the spawn and looking about, which is the gesture the
+  // complaint is about — the walk above never turns the camera at all.
+  const standing = seeded(() =>
+    createWalker(terrain, listener, spawn.x, spawn.z, town.buildings, canopyIndex, facing, undefined, {
+      water: recipe.water ?? null,
+      reducedMotion: true,
+    })
+  );
+  framing(standing, 'at the spawn');
+  standing.dispose();
 
   // --- and the one the hypothesis is about ----------------------------------
   // Walking the village street. The spawn is hundreds of metres from any house
@@ -734,12 +1049,29 @@ const probe = (slug: string, sources: NatureSources) => {
       `village: densest cluster at ${fixed(dense.x, 1)},${fixed(dense.z, 1)} with ${best} buildings inside 60 m`
     );
 
-    const throughTown = createWalker(terrain, listener, edgeX, edgeZ, town.buildings, canopyIndex, heading, undefined, {
-      water: recipe.water ?? null,
-      reducedMotion: true,
-    });
-    report('through the village', walk(throughTown, terrain, town.buildings, canopyIndex, heading, nearTrees));
+    const throughTown = seeded(() =>
+      createWalker(terrain, listener, edgeX, edgeZ, town.buildings, canopyIndex, heading, undefined, {
+        water: recipe.water ?? null,
+        reducedMotion: true,
+      })
+    );
+    report(
+      'through the village',
+      walk(throughTown, terrain, town.buildings, canopyIndex, heading, nearTrees, waterLevel)
+    );
     throughTown.dispose();
+
+    // In the lane, where something is on the camera line and the distance is
+    // being shortened — the framing has to hold through that too, or clearing a
+    // doorway moves the body up the frame.
+    const inTown = seeded(() =>
+      createWalker(terrain, listener, dense.x, dense.z, town.buildings, canopyIndex, heading, undefined, {
+        water: recipe.water ?? null,
+        reducedMotion: true,
+      })
+    );
+    framing(inTown, 'in the village');
+    inTown.dispose();
 
     const sampled = survey(terrain, town.buildings, canopyIndex, dense, waterLevel);
     console.log(

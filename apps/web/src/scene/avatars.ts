@@ -13,6 +13,7 @@ import {
   type Material,
 } from 'three';
 
+import type { AvatarRides, RiderRig } from './avatar-ride';
 import { createHuman, TARGET_HEIGHT, type Human, type HumanSource } from './human';
 import { createConicalHat, createPersonParts, PERSON_HEIGHT } from './person';
 
@@ -23,6 +24,31 @@ export type RemotePlayer = {
   y: number;
   z: number;
   yaw: number;
+  /**
+   * Where the machine points, which is not where the rider looks. Once somebody
+   * is riding, `yaw` is their own view heading and the vehicle has its own — a
+   * bike on a left-hander is pointed into the bend while the rider's head is
+   * already down the exit.
+   */
+  heading: number;
+  /**
+   * '' on foot, otherwise the vehicle kind they are on.
+   *
+   * This is the field that stops a companion being drawn as a jogger covering
+   * 25 m/s, which is the giveaway that nothing is synchronised. The roster of
+   * kinds lives in `vehicles.ts` and never reaches the server, so the room
+   * bounds this by shape and length rather than against a list.
+   */
+  riding: string;
+  /** m/s, so a companion's wheels and lean can be driven without having to
+   *  differentiate positions that arrive at whatever rate the network manages. */
+  speed: number;
+  racing: boolean;
+  lap: number;
+  check: number;
+  /** Milliseconds. 0 is "no time yet", not zero. */
+  bestMs: number;
+  finishedMs: number;
 };
 
 /**
@@ -45,6 +71,29 @@ const MOVING = 0.15;
 
 /** Metres of jump that mean a teleport rather than a walk — travelling to a place. */
 const SNAP = 25;
+
+/**
+ * Whether a position from the room is a position at all.
+ *
+ * Defensive, and known to be defensive: this was written while chasing a report
+ * of two people in one room seeing nothing of each other, on the theory that an
+ * `onStateChange` can fire when a player is added but before their fields are
+ * decoded. That theory was then **disproved** — measured on the live site with
+ * two browsers and a fresh join, the companion renders correctly at 88 px, so no
+ * such frame was ever observed and this is not the cause of anything reported.
+ *
+ * It stays because the failure it prevents is unrecoverable rather than merely
+ * wrong, which is a bad property to leave in reach. An unvalidated position goes
+ * into `avatar.position`, and from there a NaN never leaves: `position.lerp`
+ * propagates it, and the teleport escape below cannot clear it either. One bad
+ * frame from anywhere — a future field added to the schema, a hand-rolled test
+ * harness, a reconnect that races a decode — would pin an avatar at an
+ * unrenderable position for the rest of the session, with nothing in the console
+ * and a roster that still says the player is there. `probe/avatar-sync.ts`
+ * demonstrates both the latch and this guard.
+ */
+const placed = (player: RemotePlayer): boolean =>
+  Number.isFinite(player.x) && Number.isFinite(player.y) && Number.isFinite(player.z);
 /** Exponential ease toward the last known position. The room sends ten a second. */
 const EASE_RATE = 9;
 
@@ -133,6 +182,14 @@ const attachHat = (human: Human, geometry: BufferGeometry, material: Material) =
 type Entry = {
   group: Group;
   human: Human | null;
+  /**
+   * The nodes that *are* the walking figure — the rig's own group, or the
+   * primitive body and its hat. Collected rather than reached for, because what
+   * has to be hidden once somebody is on a machine differs between the two and
+   * the label must never be: a name you cannot see is a companion you cannot
+   * find, which is the whole reason the sprite has `depthTest: false`.
+   */
+  body: Object3D[];
   /** Materials this avatar owns. The rig clone shares its geometry, never these. */
   materials: Material[];
   label: Sprite;
@@ -146,6 +203,17 @@ type Entry = {
   /** Metres per second the figure is covering on screen, eased. */
   speed: number;
   name: string;
+  /**
+   * The machine under them, or null on foot. Claimed in `sync` — which runs at
+   * the room's rate, not the frame's — so a companion mounting never costs the
+   * frame it happens on anything but a `visible = true`.
+   */
+  rig: RiderRig | null;
+  /** What `riding` said when the rig was claimed, so a change can be noticed. */
+  riding: string;
+  /** The heading and speed of the machine, as the room last reported them. */
+  heading: number;
+  machineSpeed: number;
 };
 
 export type Avatars = {
@@ -167,8 +235,18 @@ export type Avatars = {
  * toward its last known position rather than snapped, and the walk cycle is
  * driven by how fast it is actually covering ground. Nothing in the room tells
  * us whether somebody is running; the only honest signal is how far they moved.
+ *
+ * That still holds for the feet and no longer holds for a wheel. `RemotePlayer`
+ * now carries `riding`, `heading` and `speed`, and a companion on a machine is
+ * handed to `avatar-ride.ts` to be drawn as one: the walking body stands down,
+ * the machine's own seated figure takes over, and the wheels turn at the speed
+ * the room reported rather than at the speed the easing happened to produce.
+ *
+ * @param rides the companions' machines. Omitted — in `probe/avatar-sync.ts`,
+ *   and anywhere the fleet has not been built — a rider is drawn as a walking
+ *   body, which is the behaviour this file had before and not a new failure.
  */
-export const createAvatars = (humanSource?: HumanSource): Avatars => {
+export const createAvatars = (humanSource?: HumanSource, rides?: AvatarRides): Avatars => {
   const parts = createPersonParts();
   const hatGeometry = createConicalHat();
   const hatMaterial = new MeshStandardMaterial({
@@ -188,6 +266,7 @@ export const createAvatars = (humanSource?: HumanSource): Avatars => {
     const entry = entries.get(id);
     if (!entry) return;
 
+    rides?.release(id);
     group.remove(entry.group);
     if (entry.human) {
       entry.human.dispose();
@@ -206,6 +285,7 @@ export const createAvatars = (humanSource?: HumanSource): Avatars => {
     group.add(avatar);
 
     const materials: Material[] = [];
+    const body: Object3D[] = [];
     let human: Human | null = null;
     let labelHeight = PERSON_HEIGHT;
 
@@ -225,6 +305,7 @@ export const createAvatars = (humanSource?: HumanSource): Avatars => {
 
       attachHat(human, hatGeometry, hatMaterial);
       human.play('idle');
+      body.push(human.group);
     } else {
       const bodyMaterial = new MeshStandardMaterial({
         color: new Color(colour),
@@ -233,11 +314,12 @@ export const createAvatars = (humanSource?: HumanSource): Avatars => {
         metalness: 0,
       });
       materials.push(bodyMaterial);
-      const body = new Mesh(parts.body, bodyMaterial);
+      const torso = new Mesh(parts.body, bodyMaterial);
       const hat = new Mesh(parts.hat, hatMaterial);
-      body.castShadow = true;
+      torso.castShadow = true;
       hat.castShadow = true;
-      avatar.add(body, hat);
+      avatar.add(torso, hat);
+      body.push(torso, hat);
     }
 
     const label = createLabel();
@@ -247,6 +329,7 @@ export const createAvatars = (humanSource?: HumanSource): Avatars => {
     return {
       group: avatar,
       human,
+      body,
       materials,
       label: label.sprite,
       labelCanvas: label.canvas,
@@ -260,6 +343,10 @@ export const createAvatars = (humanSource?: HumanSource): Avatars => {
       targetYaw: player.yaw,
       speed: 0,
       name: player.name,
+      rig: null,
+      riding: '',
+      heading: player.heading,
+      machineSpeed: 0,
     };
   };
 
@@ -271,6 +358,11 @@ export const createAvatars = (humanSource?: HumanSource): Avatars => {
       const seen = new Set<string>();
 
       for (const player of players) {
+        // Held out of the roster entirely rather than created at a position that
+        // is not one: `seen` is what decides who survives the sweep below, so an
+        // unplaced player is simply not in the room yet, and the next snapshot —
+        // which is at most a tenth of a second away — admits them.
+        if (!placed(player)) continue;
         seen.add(player.id);
         let entry = entries.get(player.id);
 
@@ -281,7 +373,35 @@ export const createAvatars = (humanSource?: HumanSource): Avatars => {
         }
 
         entry.target.set(player.x, player.y, player.z);
-        entry.targetYaw = player.yaw;
+        entry.targetYaw = Number.isFinite(player.yaw) ? player.yaw : entry.targetYaw;
+
+        /**
+         * Which machine, claimed here rather than in `update`.
+         *
+         * `sync` runs when the room sends, ten times a second at most, and a rig
+         * is only *claimed* — every one of them was assembled when the scene was.
+         * So the frame somebody mounts on costs a map lookup and a `visible`
+         * flag, which is the hard requirement: it must not be the frame that
+         * merges geometry or compiles a shader.
+         *
+         * `riding` is bounded by the room to a lowercase token of at most 24
+         * characters and never checked against a list of kinds, because the list
+         * is a browser file — so `claim` is what decides whether it is something
+         * that can be drawn, and a kind it does not know falls back to the
+         * walking body rather than to nothing.
+         */
+        const riding = typeof player.riding === 'string' ? player.riding : '';
+        if (riding !== entry.riding) {
+          if (entry.rig) {
+            entry.rig.hide();
+            rides?.release(player.id);
+            entry.rig = null;
+          }
+          entry.riding = riding;
+          if (riding) entry.rig = rides?.claim(player.id, riding) ?? null;
+        }
+        if (Number.isFinite(player.heading)) entry.heading = player.heading;
+        entry.machineSpeed = Number.isFinite(player.speed) ? player.speed : 0;
       }
 
       for (const id of [...entries.keys()]) {
@@ -298,7 +418,14 @@ export const createAvatars = (humanSource?: HumanSource): Avatars => {
         // Travelling to a place crosses kilometres in one update. Easing that
         // would send the figure gliding across the map at two hundred km/h and
         // put it in the run clip for the whole trip.
-        const teleported = previous.distanceToSquared(entry.target) > SNAP * SNAP;
+        //
+        // Written as "not a short step" rather than "a long one". For every real
+        // distance the two are the same test; for NaN they are not, because both
+        // `NaN > x` and `NaN <= x` are false — so the positive form sent a figure
+        // whose position had gone bad down the easing branch, where `lerp` cannot
+        // recover it. Snapping onto the target is the only answer available there
+        // and is also the right answer for the case this was written for.
+        const teleported = !(previous.distanceToSquared(entry.target) <= SNAP * SNAP);
         if (teleported) {
           entry.group.position.copy(entry.target);
           entry.speed = 0;
@@ -314,12 +441,43 @@ export const createAvatars = (humanSource?: HumanSource): Avatars => {
         );
         entry.group.rotation.y += difference * ease;
 
-        if (entry.human) {
+        /**
+         * The machine, under the body's *eased* position and not under the
+         * target the room sent — a bike placed at the target while the rider
+         * eases toward it rides a tenth of a second ahead of the person on it.
+         *
+         * Its own heading, not `entry.group.rotation.y`: that is the rider's
+         * view yaw, eased, and a bike on a left-hander is pointed into the bend
+         * while the rider's head is already down the exit.
+         */
+        const riding = entry.rig !== null;
+        if (entry.rig) {
+          entry.rig.place(
+            entry.group.position.x,
+            entry.group.position.y,
+            entry.group.position.z,
+            entry.heading,
+            entry.machineSpeed,
+            delta
+          );
+        }
+
+        // Astride something with wheels the walking body stands down, exactly as
+        // the local rider's does in `walker.ts`: the figure in the saddle is the
+        // machine's own, built sitting, and two bodies in one place is one too
+        // many. A companion whose `riding` is a kind this cannot draw keeps their
+        // walking body, which is why this is `entry.rig` and not `entry.riding`.
+        for (let index = 0; index < entry.body.length; index += 1) entry.body[index].visible = !riding;
+
+        if (entry.human && !riding) {
           const moving = entry.speed > MOVING;
           const clip = entry.speed > RUN_CLIP_AT ? 'run' : 'walk';
           const reference = clip === 'run' ? RUN_CLIP_SPEED : WALK_CLIP_SPEED;
           // Driving the clip at the rate the body is travelling is what stops the
           // feet skating: one cycle at a fixed rate cannot cover 1 m/s and 4 m/s.
+          // Still the *measured* speed and not the room's `speed`, which is only
+          // ever a machine's: nothing in the room says whether somebody is
+          // running, so how far they moved remains the only honest signal.
           const rate = moving ? Math.min(MAX_CLIP_RATE, Math.max(0.35, entry.speed / reference)) : 1;
           entry.human.update(delta * rate);
           entry.human.play(moving ? clip : 'idle');
@@ -343,6 +501,10 @@ export const createAvatars = (humanSource?: HumanSource): Avatars => {
     },
     dispose: () => {
       for (const id of [...entries.keys()]) remove(id);
+      // Handed in rather than made here, and disposed here all the same: it was
+      // put in this group, so it goes out with it. What it releases is only the
+      // scene graph — its geometries and materials are the fleet's kit's.
+      rides?.dispose();
       parts.dispose();
       hatGeometry.dispose();
       hatMaterial.dispose();

@@ -177,9 +177,25 @@ for (const slug of slugs) {
   // not the ride: `vehicles.stand` carries the spot in across the kerb until the
   // carriageway's deck is under it, and drops it on the ground if none is.
   {
-    const slots = Math.min(3, net.parking.length, Math.max(1, Math.floor(16 / 4)));
+    // Paired by proximity, not by index. `vehicles.ts` now puts one bike at the
+    // head of each *row* — `ParkingSpot.area` — so the bike list and the slot
+    // list no longer run in step, and indexing one by the other reported a bike
+    // "carried 702 m" from a slot it had never been near, then ran off the end
+    // of the array. Which slot a bike is standing on is a question about where
+    // it is, so that is how it is asked.
+    const areas = new Set(net.parking.map((spot) => spot.area)).size;
+    console.log(
+      `  ${areas} place${areas === 1 ? '' : 's'} to find one, ${net.parking.length} slots, ${bikes.length} bikes standing`
+    );
     for (const [n, ridable] of bikes.entries()) {
-      const spot = net.parking[Math.floor((n / slots) * net.parking.length)];
+      let spot = net.parking[0];
+      let near = Infinity;
+      for (const slot of net.parking) {
+        const gap = Math.hypot(slot.x - ridable.position.x, slot.z - ridable.position.z);
+        if (gap >= near) continue;
+        near = gap;
+        spot = slot;
+      }
       const ground = terrain.heightAt(spot.x, spot.z);
       const stands = floorAt(ridable.position.x, ridable.position.z, ridable.position.y);
       console.log(
@@ -310,13 +326,34 @@ for (const slug of slugs) {
   let top = 0;
   let reach = 0;
   {
-    let last = at();
-    follow(road.road, road.at, 10, (n) => {
-      const speed = away(last) / DELTA;
-      last = at();
-      if (speed > top) top = speed;
-      if (reach === 0 && speed > 8.55) reach = (n + 1) * DELTA;
+    /**
+     * Speed over a tenth of a second, and the 95% mark taken against the top
+     * this run actually reached.
+     *
+     * Both halves were wrong and both were invisible. The threshold was the
+     * literal `8.55`, which is 95% of a 9 m/s top speed that no longer exists —
+     * so the column went on being printed as "95% of it" while measuring the
+     * time to a fixed 8.55 m/s. And the speed was one frame's displacement over
+     * 1/60 s, which catches the machine settling onto the floor on the frame it
+     * is boarded — `standY` eases at `STEP_EASE` and the first step is resolved
+     * out of whatever the bike was parked inside — and reads as a motorbike
+     * leaving the line at nearly a g. Measured here before the fix: 1.0 s to
+     * 8.55 m/s at Tà Xùa, against the 2.3 s the model's own force curve gives.
+     */
+    const WINDOW = Math.max(1, Math.round(0.1 / DELTA));
+    const trail: { x: number; z: number }[] = [at()];
+    const series: number[] = [];
+    follow(road.road, road.at, 10, () => {
+      trail.push(at());
+      const back = trail.length - 1 - WINDOW;
+      if (back < 0) return;
+      const then = trail[back];
+      const now = trail[trail.length - 1];
+      series.push(Math.hypot(now.x - then.x, now.z - then.z) / (WINDOW * DELTA));
     });
+    for (const speed of series) if (speed > top) top = speed;
+    const found = series.findIndex((speed) => speed >= top * 0.95);
+    reach = found < 0 ? 0 : (found + WINDOW) * DELTA;
   }
   console.log(
     `  prompt walking up to it: "${offered}" | on the ${road.road.kind} road, ${road.away.toFixed(0)} m from the ` +
@@ -526,30 +563,47 @@ for (const slug of slugs) {
     start(road.road.points[road.at * 3], road.road.points[road.at * 3 + 2], headingAlong(road.road, road.at));
     let last = at();
     let before = 0;
-    follow(road.road, road.at, 6, () => {
+    let where = road.at;
+    follow(road.road, road.at, 6, (_n, sample) => {
       before = away(last) / DELTA;
       last = at();
+      where = sample;
     });
+    /**
+     * On the centreline two samples ahead, which at the published 7 m spacing is
+     * about 14 m up the road.
+     *
+     * It used to be 14 m along `walker.yaw`, and that only coincided with the
+     * road while the road was straight. Now that the roads bend — and now that a
+     * rider arrives at 19 m/s instead of 9 — the heading after six seconds is
+     * wherever the last corner left it, and the post was being planted in a
+     * field: measured at Hồ Tây, the bike finished 51.33 m from a post it had
+     * driven straight past, and its speed went *up* through the test.
+     */
+    const samples = Math.floor(road.road.points.length / 3);
+    const ahead = Math.min(samples - 1, where + 2);
     post = {
-      x: walker.position.x + Math.sin(walker.yaw) * 14,
-      z: walker.position.z + Math.cos(walker.yaw) * 14,
+      x: road.road.points[ahead * 3],
+      z: road.road.points[ahead * 3 + 2],
       radius: 2,
       bottom: 0,
       top: 1000,
     };
     let into = 0;
+    let gap = Infinity;
     // Still riding the road, so what stops it is the post and not the verge.
     follow(road.road, road.at, 6, () => {
       into = away(last) / DELTA;
       last = at();
+      const reach = Math.hypot(walker.position.x - post!.x, walker.position.z - post!.z);
+      if (reach < gap) gap = reach;
     });
-    const gap = Math.hypot(walker.position.x - post.x, walker.position.z - post.z);
     const pinned = at();
     run(2.5, { x: 1, y: 0 });
     run(3, { x: 0, y: 1 });
     console.log(
       `  a 2 m post 14 m up the road: ${before.toFixed(2)} m/s up to it, ${into.toFixed(2)} m/s against it, ` +
-        `stopped ${gap.toFixed(2)} m off its centre (2 m post + 0.45 shoulder); walked round and ridden away ` +
+        `closest ${gap.toFixed(2)} m to its centre (2 m post + 0.45 shoulder); walked round and ridden away ` +
         `leaves it ${Math.hypot(walker.position.x - post.x, walker.position.z - post.z).toFixed(1)} m off, ` +
         `${away(pinned).toFixed(1)} m from where it was pinned`
     );

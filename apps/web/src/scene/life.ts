@@ -2,6 +2,7 @@ import { createPrng, type LocationRecipe, type Terrain } from '@otrip/world';
 import { Group, Matrix4, Quaternion, Vector3 } from 'three';
 
 import { createBirds, type Birds } from './birds';
+import type { DriveSpec } from './driving';
 import { BOAT_BEAM, BOAT_DRAUGHT, BOAT_LENGTH, BOAT_SOLE, BOAT_WATERLINE, createBoatKit, type Boat } from './boat';
 import type { Mooring } from './dock';
 import { createHuman, type Human, type HumanSource } from './human';
@@ -44,12 +45,59 @@ export type Ridden = {
   z: number;
   /** Radians about Y, the way `Object3D.rotation.y` reads it. */
   heading: number;
+  /** m/s up its own nose. Negative is being walked backwards. */
   speed: number;
   /** Rad/s the heading is turning, positive to the rider's left. */
   turn: number;
   /** Metres risen per metre travelled, under the wheels. */
   grade: number;
   delta: number;
+  /**
+   * Radians the velocity lies to the left of the nose. Zero while it tracks;
+   * this is the whole of what tells a renderer the machine is sideways, and
+   * without it a drift is drawn as a tidy cornering line.
+   */
+  slip: number;
+  /**
+   * m/s² to the rider's left, from the tyres. The body leans against this
+   * rather than against `speed * turn`: the two agree while the machine tracks
+   * and part company in a slide, which is exactly where the lean matters.
+   */
+  lateral: number;
+  /**
+   * Radians of lock actually at the steered wheel.
+   *
+   * Handed over rather than re-derived, because the two answers part company in
+   * exactly the case worth drawing: Ackermann off the yaw rate says where the
+   * wheel would be if the machine were tracking, and in a slide it is not — a
+   * rider catching one has the bars turned *into* the slide, which is the single
+   * most recognisable thing about a drift and cannot be worked out from the yaw
+   * rate alone.
+   */
+  steer: number;
+  /** 0 to 1 of brake applied, for the brake light. */
+  brake: number;
+  /** 0 to 1 in the boost meter, and 0 to 1 of it actually lit. */
+  boost: number;
+  boosting: number;
+  /** 0 to 1 of each axle's grip gone, for a tyre-smoke cue. */
+  frontSlide: number;
+  rearSlide: number;
+  /**
+   * Whether the camera is at the rider's own eyes this frame.
+   *
+   * The one thing a machine needs to know about the view, and it needs it
+   * because of what is sitting on it: `motorbikeBuild` puts a seated figure in
+   * the saddle and that figure is who the first-person camera *is*, so drawn
+   * from inside it you are looking at the back of its skull. The walking avatar
+   * already stands down astride anything; this is the same decision for the
+   * figure that replaced it.
+   *
+   * It did not exist while the scene had one 2 m near plane, because at that
+   * plane nothing within arm's reach of the saddle was drawn at all. It exists
+   * now that the cockpit is rendered in a second pass that can see it.
+   */
+  firstPerson: boolean;
 };
 
 /**
@@ -62,16 +110,22 @@ export type Ridden = {
  * do and is told where it ended up.
  */
 export type Machine = {
-  /** m/s with the throttle open on the flat. */
+  /**
+   * Everything `driving.ts` needs to work out what this machine will do: its
+   * mass, power, drag, the grip of its tyres and where its weight sits.
+   *
+   * It is a description of the machine and not a table of outcomes, which is the
+   * change that fixed the complaint. The old contract named `topSpeed`, `accel`
+   * and `grip` and the walker approached them at constant rates — so the top
+   * speed was a clamp somebody had chosen, and the clamp was 9 m/s, slower than
+   * the 14 m/s a body covers ground at on foot. Now the force falls as the speed
+   * rises and the top speed is where it meets the drag: 23.6 m/s on the Wave,
+   * which is the 85 km/h the real machine does.
+   */
+  drive: DriveSpec;
+  /** m/s the throttle will hold on the flat — `tuneDrive`'s own answer, carried
+   *  here for the HUD and for how far the camera trails. Not a limit. */
   topSpeed: number;
-  /** m/s backwards: a rider walking it off the kerb, not a reverse gear. */
-  reverse: number;
-  accel: number;
-  brake: number;
-  /** Lateral acceleration the tyres hold, m/s². With `topSpeed`, the circle. */
-  grip: number;
-  /** Rad/s cap at a crawl, where the rider's feet and not the tyres decide. */
-  pivot: number;
   /** The steepest bare ground it will take, as `terrain.slopeAt` reads it. */
   climb: number;
   /** Metres of water it will ride through. */
@@ -114,6 +168,16 @@ export type Rideable = {
   steer?: (orders: Orders | null) => void;
   /** Set on something the rider drives; absent on a hull that carries them. */
   machine?: Machine;
+  /**
+   * Whether a walker could reach it on foot right now.
+   *
+   * Optional, and absent means yes: a parked machine is always at its stand —
+   * `vehicles.rideables()` returns only the parked array — so the one thing this
+   * has to express is a hull that is no longer tied up. Three of the five boats
+   * on a lake are under way at the top detail tier, and a map that offers those
+   * as somewhere to walk to sends a player to a shore with nothing on it.
+   */
+  atRest?: () => boolean;
 };
 
 export type Life = {
@@ -280,8 +344,13 @@ export const createLife = (
       bounds: { across: BOAT_BEAM / 2, along: BOAT_LENGTH / 2 },
       helmStation: { along: HELM_ALONG, across: HELM_ACROSS },
       steer: () => {},
+      // Read from the state rather than captured: `steer` clears `moored` the
+      // first time she is given an order, and a boat you rowed away is gone.
+      atRest: () => state.moored,
     };
-    const state: BoatState = {
+    // eslint-disable-next-line prefer-const
+    let state: BoatState;
+    state = {
       boat,
       x,
       z,
@@ -306,20 +375,40 @@ export const createLife = (
   if (recipe.water && boatKit) {
     const wanted = Math.min(MAX_BOATS, counts.boats);
 
-    // One of them lies at the jetty and stays there. "Bến thuyền" is a place the
-    // panel sends people to walk to, and the boats below knew only that they
-    // were on water: measured from the berth, the nearest was 382 m away at
-    // Tràng An, 628 m at Hồ Tây, 941 m at Hội An, and all of them under way.
-    // So the landing was a name you could reach with nothing to board. This is
-    // one of the four and not a fifth — more boats would only have raised the
-    // odds, which is not the same as putting one where it belongs. The deepest
-    // berth, because a hull wants the water the dock's own search found most of.
-    const berth = moorings.reduce<Mooring | null>(
-      (best, m) => (!best || terrain.heightAt(m.x, m.z) < terrain.heightAt(best.x, best.z) ? m : best),
-      null
-    );
-    if (berth && wanted > 0) {
-      const boat = boatKit.create(0);
+    /**
+     * Two of them lie at the jetty and stay there.
+     *
+     * "Bến thuyền" is a place the panel sends people to walk to, and the boats
+     * below knew only that they were on water: measured from the berth, the
+     * nearest was 382 m away at Tràng An, 628 m at Hồ Tây, 941 m at Hội An, and
+     * all of them under way. So the landing was a name you could reach with
+     * nothing to board.
+     *
+     * It was one boat, which was right until somebody took it. A boat you rowed
+     * away is gone and the berth stays empty — that is deliberate and correct —
+     * but it left the landing with nothing for the rest of the session, and
+     * nothing for whoever you came with. So a second lies alongside, and one is
+     * always kept under way: a river whose every boat is tied up is a car park,
+     * which is the thing the count was held down to avoid in the first place.
+     *
+     * The deepest berths, because a hull wants the water the dock's own search
+     * found most of.
+     */
+    const berths = [...moorings].sort((a, b) => terrain.heightAt(a.x, a.z) - terrain.heightAt(b.x, b.z));
+    /**
+     * Both berths filled wherever there are two, including on the lowest tier
+     * where that is the whole fleet.
+     *
+     * It was `wanted - 1`, to keep one under way. Measured, that gave the lowest
+     * tier — two boats, which is what a phone gets — a single moored hull, and a
+     * landing with one boat is a landing that empties the moment anybody takes
+     * it. On a tier that can afford three or more the balance holds anyway; on
+     * the one that cannot, a boat you can row beats a boat you can watch.
+     */
+    const tied = Math.min(2, berths.length, wanted);
+    for (let index = 0; index < tied && boats.length < wanted; index += 1) {
+      const berth = berths[index];
+      const boat = boatKit.create(boats.length);
       boat.setUnderway(false);
       group.add(boat.group);
       // `yaw` is ready for `rotation.y`; the render below works back from
